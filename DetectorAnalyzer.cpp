@@ -263,57 +263,46 @@ bool DetectorAnalyzer::syncDataStream(std::ifstream& ifs, long long& skippedByte
 // ----------------------------------------------------------------------------
 // ファイル読み込み (修正済み: EOF無限ループ防止 + ハイブリッドスキップ)
 // ----------------------------------------------------------------------------
+
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(
     const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset
 ) {
     if (offset == 0) {
+        // ファイル切り替え時のログ（これは残します）
         printLog("Opening NEW file [Mod " + std::to_string(modID) + "]: " + fileName);
+        currentRunPrefix_[modID] = getRunSignature(fileName);
     }
-    
-    std::string prefix = getRunSignature(fileName);
-    short rid = getRunID(prefix); 
-    currentRunPrefix_[modID] = prefix;
+    short rid = getRunID(currentRunPrefix_[modID]); 
 
     std::ifstream ifs(fileName, std::ios::binary);
-    if (!ifs.is_open()) return {0, true}; 
-
-    unsigned long long currentBaseTime = baseTimeMap_[modID]; 
-    bool hasSeenHeader = hasSeenTimeHeaderMap_[modID]; 
-
-    // --- オフセット適用と初期Sync ---
-    if (offset == 0) {
-        long long skip = 0;
-        if (!syncDataStream(ifs, skip)) {
-            printLog("[WARNING] Mod " + std::to_string(modID) + ": No sync found in header area.");
-            return {0, true};
-        }
-        offset = ifs.tellg(); 
-        hasSeenHeader = false; 
-    } else {
-        ifs.seekg(offset, std::ios::beg);
-    }
+    if (!ifs.is_open()) return {baseTimeMap_[modID], true};
 
     ifs.seekg(0, std::ios::end);
     long long fileSize = ifs.tellg();
     ifs.seekg(offset, std::ios::beg);
+
+    if (!ifs) return {baseTimeMap_[modID], true}; 
+
+    unsigned long long currentBaseTime = baseTimeMap_[modID]; 
+    bool hasSeenHeader = hasSeenTimeHeaderMap_[modID]; 
+    
+    // オフセット0（新規ファイル）ならヘッダ未発見状態からスタート
+    if (offset == 0) hasSeenHeader = false;
 
     const size_t BUFFER_SIZE = 64 * 1024 * 1024; 
     std::vector<char> buffer(BUFFER_SIZE);
     const size_t MAX_EVENTS_IN_THIS_CALL = 2000000; 
     size_t eventsReadThisCall = 0;
     size_t leftover = 0;
-    
     unsigned long long lastT = currentBaseTime; 
     bool timeLimitReached = false;
+    long long initialOffset = offset;
 
-    while (ifs && eventsReadThisCall < MAX_EVENTS_IN_THIS_CALL) {
+    while (eventsReadThisCall < MAX_EVENTS_IN_THIS_CALL) {
         ifs.read(buffer.data() + leftover, BUFFER_SIZE - leftover);
         size_t readCount = ifs.gcount();
-        
-        // ★★★ 修正の核心: 無限ループ防止 ★★★
-        // 読み込みサイズが0で、残りが1パケット(8バイト)未満なら、これ以上読めないため強制終了
-        if (readCount == 0 && leftover < 8) {
-            offset = fileSize; // ファイルサイズまで進めて「完了」扱いにし、ループを脱出
+        if (readCount == 0) {
+            offset = fileSize; 
             break; 
         }
 
@@ -324,45 +313,63 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(
         while (i + 8 <= totalBytesInBuffer) {
             unsigned char h = buf[i];
 
-            // モードA: T0探索 (ハイブリッド・スキップ)
-            if (!hasSeenHeader) {
-                if (h == 0x69) { // T0候補
-                    if (i + 80 > totalBytesInBuffer) break; 
-                    bool ok = true;
-                    for (int k = 1; k < 10; ++k) {
-                        unsigned char nh = buf[i + (k * 8)];
-                        if (nh != 0x69 && nh != 0x6a) { ok = false; break; }
-                    }
-                    if (ok) {
-                        unsigned char* p = &buf[i+1];
-                        unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-                        unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
-                        unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
-                        
-                        if (ss < 1000 && t < 50) {
-                            currentBaseTime = s * 1000000000ULL + ss * 1000000ULL + t;
-                            hasSeenHeader = true;
-                            lastT = currentBaseTime;
-                            moduleAliveTime_[modID] = currentBaseTime;
-                            i += 8; continue;
-                        }
-                    }
-                } 
-                else if (h == 0x6a) { 
-                    i += 8; continue; // データパケット高速スキップ
-                }
-                i++; continue; // ゴミなら1バイト
-            }
-
-            // モードB: 通常解析
-            bool syncOK = true;
-            if (i + 80 <= totalBytesInBuffer) {
+            // -------------------------------------------------------------
+            // 共通 Syncチェック (10パケット先読み)
+            // -------------------------------------------------------------
+            bool syncOK = false;
+            if (i + 80 > totalBytesInBuffer) {
+                // バッファ末尾は単体チェック
+                if (h == 0x69 || h == 0x6a) syncOK = true;
+            } else {
+                syncOK = true;
                 for (int k = 1; k < 10; ++k) {
                     unsigned char nh = buf[i + (k * 8)];
                     if (nh != 0x69 && nh != 0x6a) { syncOK = false; break; }
                 }
             }
 
+            // -------------------------------------------------------------
+            // T0探索モード (!hasSeenHeader)
+            // -------------------------------------------------------------
+            if (!hasSeenHeader) {
+                // アライメント維持 (SyncOKならT0でもデータでも8バイト進む)
+                if (syncOK && (h == 0x69 || h == 0x6a)) {
+                    
+                    if (h == 0x69) {
+                        unsigned char* p = &buf[i+1];
+                        unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                        unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
+                        unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
+                        
+                        // ★★★ T0値 解析ログ (ファイル毎に1回だけ出力) ★★★
+                        // 計算がおかしいか、生データがおかしいかを確認するため
+                        if (ss < 1000 && t < 50) {
+                            printLog("[T0 CHECK] Mod " + std::to_string(modID) + " Found valid T0 header at offset " + std::to_string(offset + i));
+                            printLog("   Raw Bytes (Hex): " 
+                                     + std::to_string((int)p[0]) + " " + std::to_string((int)p[1]) + " " 
+                                     + std::to_string((int)p[2]) + " " + std::to_string((int)p[3]) + " | " 
+                                     + std::to_string((int)p[4]) + " " + std::to_string((int)p[5]) + " " + std::to_string((int)p[6]));
+                            printLog("   Calculated: s=" + std::to_string(s) + " ss=" + std::to_string(ss) + " t=" + std::to_string(t));
+
+                            currentBaseTime = s * 1000000000ULL + ss * 1000000ULL + t;
+                            hasSeenHeader = true;
+                            lastT = currentBaseTime;
+                            moduleAliveTime_[modID] = currentBaseTime;
+                        }
+                    }
+                    
+                    i += 8; 
+                    continue; 
+                }
+                
+                // SyncNGなら1バイト進む
+                i++; 
+                continue; 
+            }
+
+            // -------------------------------------------------------------
+            // 通常解析モード (hasSeenHeader)
+            // -------------------------------------------------------------
             if (syncOK) {
                 if (h == 0x69) {
                     unsigned char* p = &buf[i+1];
@@ -371,6 +378,7 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(
                     unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
                     if (ss < 1000 && t < 50) {
                         unsigned long long newTime = s * 1000000000ULL + ss * 1000000ULL + t;
+                        // 異常な時間飛び（100秒以上）は無視するガード
                         if (newTime < currentBaseTime + 100000000000ULL) {
                             currentBaseTime = newTime; 
                             lastT = currentBaseTime;
@@ -388,13 +396,15 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(
 
                     if (mod < MAX_MODULES && sys < MAX_SYS_CH && ch_LUT[mod][sys].isValid) {
                         long long diff = (long long)tof - (long long)pw;
+                        // 負のDiffや大きすぎるDiffはノイズとして弾く
                         if (!(diff < 0 && currentBaseTime < (unsigned long long)std::abs(diff))) {
                             unsigned long long eventT = currentBaseTime + diff;
                             lastT = eventT;
                             moduleAliveTime_[modID] = eventT;
-
                             if (globalStartTimestamp_ == 0 || eventT < globalStartTimestamp_) globalStartTimestamp_ = eventT;
-                            if (analysisDuration_ns_ != std::numeric_limits<unsigned long long>::max() && eventT > globalStartTimestamp_ + analysisDuration_ns_) {
+                            
+                            if (analysisDuration_ns_ != std::numeric_limits<unsigned long long>::max() && 
+                                eventT > globalStartTimestamp_ + analysisDuration_ns_) {
                                 timeLimitReached = true;
                             } else {
                                 rawEvents.push_back({ ch_LUT[mod][sys].detTypeID, ch_LUT[mod][sys].strip, mod, eventT, (int)pw, sys, rid });
@@ -405,14 +415,14 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(
                     }
                     i += 8;
                 } else {
-                    i += 8;
+                    i += 8; 
                 }
             } else {
-                i++; // 同期喪失時は1バイトシフト
+                i++; // Sync Lost
             }
         }
         
-        offset += i;
+        offset += i; 
         processedDataSize_ += i; 
 
         if (timeLimitReached) break; 
@@ -421,11 +431,88 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(
         if (leftover > 0) std::memmove(buffer.data(), buffer.data() + i, leftover);
         if (offset >= fileSize) break;
     }
-    
+
+    // 進行しない場合の警告のみ残す
+    if (offset == initialOffset && !timeLimitReached && offset < fileSize) {
+        printLog("[WARNING] Mod " + std::to_string(modID) + " Stuck? No data advanced. Offset: " + std::to_string(offset));
+    }
+
     baseTimeMap_[modID] = currentBaseTime;
     hasSeenTimeHeaderMap_[modID] = hasSeenHeader;
     return {lastT, (offset >= fileSize || timeLimitReached)}; 
 }
+
+
+void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues) {
+    const size_t BUFFER_CAP = 2000000; 
+    std::vector<Event> eventChunk;
+    eventChunk.reserve(BUFFER_CAP * 2);
+    std::map<int, unsigned long long> moduleLastTime;
+    
+    for (auto const& [mod, q] : fileQueues) {
+        moduleLastTime[mod] = 0; 
+        currentFileOffsets_[mod] = 0;
+        baseTimeMap_[mod] = 0; 
+        hasSeenTimeHeaderMap_[mod] = false;
+        moduleAliveTime_[mod] = 0; 
+        if (!q.empty()) {
+            currentRunPrefix_[mod] = getRunSignature(q.front());
+            printLog("[INFO] Mod " + std::to_string(mod) + ": Initial file -> " + q.front());
+        }
+    }
+
+    printLog("Step 3: Parallel streaming analysis started.");
+    analysisStartTime_ = std::chrono::system_clock::now();
+
+    while (true) {
+        bool allFilesFinished = true;
+        bool anyQueueRemaining = false;
+        for (auto const& [modID, queue] : fileQueues) {
+            if (!queue.empty()) { anyQueueRemaining = true; allFilesFinished = false; }
+        }
+        if (!anyQueueRemaining && eventChunk.empty()) break;
+
+        unsigned long long currentMinTime = getSafeTime(moduleLastTime);
+
+        for (auto& [modID, queue] : fileQueues) {
+            if (queue.empty()) continue; 
+            if (eventChunk.size() < BUFFER_CAP || moduleLastTime[modID] <= currentMinTime) {
+                unsigned long long prevTime = moduleLastTime[modID];
+                auto res = readEventsFromFile(queue.front(), modID, eventChunk, currentFileOffsets_[modID]);
+                if (res.first > prevTime) moduleLastTime[modID] = res.first;
+                if (res.second) { 
+                    printLog("[INFO] Mod " + std::to_string(modID) + ": Finished reading " + queue.front());
+                    queue.pop_front(); 
+                    currentFileOffsets_[modID] = 0; 
+                    if (!queue.empty()) printLog("[INFO] Mod " + std::to_string(modID) + ": Next file -> " + queue.front());
+                }
+            }
+        }
+
+        if (!eventChunk.empty()) {
+            std::sort(eventChunk.begin(), eventChunk.end(), [](const Event& a, const Event& b){
+                return a.eventTime_ns < b.eventTime_ns;
+            });
+            unsigned long long processSafeTime = std::numeric_limits<unsigned long long>::max();
+            bool activeForProcess = false;
+            for (auto const& [m, q] : fileQueues) {
+                if (!q.empty()) { processSafeTime = std::min(processSafeTime, moduleLastTime[m]); activeForProcess = true; }
+            }
+            if (!activeForProcess) processSafeTime = eventChunk.back().eventTime_ns + 1;
+
+            auto it = std::upper_bound(eventChunk.begin(), eventChunk.end(), processSafeTime, 
+                [](unsigned long long t, const Event& e){ return t < e.eventTime_ns; });
+            size_t cut = std::distance(eventChunk.begin(), it);
+            if (cut > 0) {
+                std::vector<Event> safe(eventChunk.begin(), eventChunk.begin() + cut);
+                processChunk(safe);
+                eventChunk.erase(eventChunk.begin(), eventChunk.begin() + cut);
+            }
+        }
+    }
+    printLog("Analysis Loop Finished.");
+}
+
 
 // ----------------------------------------------------------------------------
 // 解析停止直前のバイナリダンプ
@@ -464,188 +551,6 @@ unsigned long long DetectorAnalyzer::getSafeTime(const std::map<int, unsigned lo
 // メイン解析ループ
 // ----------------------------------------------------------------------------
 
-void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues) {
-    const size_t BUFFER_CAP = 2000000;
-    std::vector<Event> eventChunk;
-    eventChunk.reserve(BUFFER_CAP * 2);
-    
-    std::map<int, unsigned long long> moduleLastTime;
-    
-    // 初期化
-    for (auto const& [mod, q] : fileQueues) {
-        moduleLastTime[mod] = 0; 
-        currentFileOffsets_[mod] = 0;
-        baseTimeMap_[mod] = 0; 
-        hasSeenTimeHeaderMap_[mod] = false;
-        moduleAliveTime_[mod] = 0;
-        
-        if (!q.empty()) {
-            currentRunPrefix_[mod] = getRunSignature(q.front());
-            printLog("[INFO] Mod " + std::to_string(mod) + ": Initial file -> " + q.front());
-        }
-    }
-
-    printLog("Step 3: Parallel streaming analysis started.");
-    analysisStartTime_ = std::chrono::system_clock::now();
-    lastGlobalAnalysisTime_ns_ = 0; 
-
-    // デバッグ: ストール（膠着）検知用カウンタ
-    int stallCounter = 0;
-
-    while (true) {
-        bool allFilesFinished = true;
-        bool dataReadInThisLoop = false;
-        bool dataProcessedInThisLoop = false;
-
-        bool anyQueueRemaining = false;
-        for (auto const& [modID, queue] : fileQueues) {
-            if (!queue.empty()) anyQueueRemaining = true;
-        }
-        if (!anyQueueRemaining) {
-            printLog("[DEBUG] Stopping analysis: All queues are empty.");
-            break; 
-        }
-
-        // SafeTime (全モジュールの最小時刻) の計算
-        unsigned long long currentMinTime = getSafeTime(moduleLastTime);
-
-        for (auto& [modID, queue] : fileQueues) {
-            if (!queue.empty()) allFilesFinished = false;
-            
-            // -------------------------------------------------------------
-            // スケジューラ判定デバッグ
-            // -------------------------------------------------------------
-            bool bufferOK = eventChunk.size() < BUFFER_CAP;
-            bool timeOK   = moduleLastTime[modID] <= currentMinTime;
-            bool shouldRead = !queue.empty() && (bufferOK || timeOK);
-
-            /*
-            // 膠着時のみ出す詳細デバッグ（普段はコメントアウト推奨だが、今回はONにするか検討）
-            if (stallCounter > 5) {
-                std::string reason = "";
-                if (queue.empty()) reason += "QueueEmpty ";
-                if (!bufferOK) reason += "BufferFull ";
-                if (!timeOK) reason += "TimeAhead(" + std::to_string(moduleLastTime[modID]) + " > " + std::to_string(currentMinTime) + ") ";
-                printLog("[DEBUG_STALL] Mod " + std::to_string(modID) + " Skip Reason: " + reason);
-            }
-            */
-
-            if (shouldRead) {
-                // 読み込み実行
-                auto res = readEventsFromFile(queue.front(), modID, eventChunk, currentFileOffsets_[modID]);
-                
-                if (res.first > 0) moduleLastTime[modID] = res.first;
-                dataReadInThisLoop = true;
-                
-                // ファイル完了処理
-                if (res.second) { 
-                    printLog("[INFO] Mod " + std::to_string(modID) + ": Finished reading " + queue.front());
-                    
-                    queue.pop_front(); 
-                    currentFileOffsets_[modID] = 0; 
-                    
-                    if (!queue.empty()) {
-                        printLog("[INFO] Mod " + std::to_string(modID) + ": Next file -> " + queue.front());
-                    } else {
-                        printLog("[INFO] Mod " + std::to_string(modID) + ": Queue empty. No more files.");
-                    }
-
-                    if (analysisDuration_ns_ != std::numeric_limits<unsigned long long>::max() && 
-                        moduleLastTime[modID] > globalStartTimestamp_ + analysisDuration_ns_) {
-                         printLog("[INFO] Global time limit reached via Module " + std::to_string(modID));
-                         allFilesFinished = true; 
-                         goto END_ANALYSIS; 
-                    }
-                }
-            }
-        }
-
-        // イベントソートと処理
-        if (!eventChunk.empty()) {
-            std::sort(eventChunk.begin(), eventChunk.end(), [](const Event& a, const Event& b){
-                return a.eventTime_ns < b.eventTime_ns;
-            });
-
-            unsigned long long safeTime = std::numeric_limits<unsigned long long>::max();
-            bool hasActive = false;
-            for (auto const& [m, q] : fileQueues) {
-                if (!q.empty()) { safeTime = std::min(safeTime, moduleLastTime[m]); hasActive = true; }
-            }
-            if (!hasActive || allFilesFinished) safeTime = eventChunk.back().eventTime_ns + 1;
-
-            auto it = std::upper_bound(eventChunk.begin(), eventChunk.end(), safeTime, 
-                [](unsigned long long t, const Event& e){ return t < e.eventTime_ns; });
-            size_t cut = std::distance(eventChunk.begin(), it);
-
-            if (cut > 0) {
-                std::vector<Event> safe(eventChunk.begin(), eventChunk.begin() + cut);
-                processChunk(safe);
-                eventChunk.erase(eventChunk.begin(), eventChunk.begin() + cut);
-                dataProcessedInThisLoop = true;
-            }
-        }
-        
-        if (allFilesFinished && eventChunk.empty()) break;
-        
-        // -------------------------------------------------------------
-        // デッドロック（空回り）検知 & 強制ダンプ
-        // -------------------------------------------------------------
-        if (!dataReadInThisLoop && !dataProcessedInThisLoop && !allFilesFinished) {
-            stallCounter++;
-            
-            // 1万回ループが空回りしたら（=フリーズ）、状況をダンプする
-            if (stallCounter % 10000 == 0) {
-                printLog("!!! STALL DETECTED !!! Loop cycling without work.");
-                printLog("Global SafeTime: " + std::to_string(currentMinTime));
-                printLog("Buffer Size: " + std::to_string(eventChunk.size()) + " / " + std::to_string(BUFFER_CAP));
-                
-                for (auto const& [mod, t] : moduleLastTime) {
-                    bool qEmpty = fileQueues[mod].empty();
-                    std::string status = "Mod " + std::to_string(mod) + ": LastTime=" + std::to_string(t);
-                    if (qEmpty) status += " [Queue Empty]";
-                    else status += " [Queue OK]";
-                    
-                    if (t > currentMinTime) status += " [WAITING (Ahead)]";
-                    else if (qEmpty) status += " [DONE]";
-                    else status += " [STUCK?]";
-                    
-                    printLog(status);
-                }
-                
-                // 強制脱出を試みる場合（デバッグ時のみ有効化）
-                // forced = true ...
-            }
-        } else {
-            // 何かしら動いていればカウンタをリセット
-            stallCounter = 0;
-        }
-
-        // デッドロック回避 (Forced Read)
-        if (stallCounter > 50000) { // 5万回空転したら強制的に読む
-             printLog("[WARNING] Force reading to break deadlock...");
-             for (auto& [m, q] : fileQueues) {
-                if (!q.empty()) {
-                    auto res = readEventsFromFile(q.front(), m, eventChunk, currentFileOffsets_[m]);
-                    if (res.first > 0) moduleLastTime[m] = res.first;
-                    if (res.second) { 
-                         printLog("[INFO] Mod " + std::to_string(m) + ": Finished (Forced) " + q.front());
-                         q.pop_front(); 
-                         currentFileOffsets_[m] = 0; 
-                    }
-                    break; 
-                }
-            }
-            stallCounter = 0; // リセット
-        }
-    }
-
-END_ANALYSIS:
-    printLog("Generating Hex Dump for debugging...");
-    for (auto const& [modID, queue] : fileQueues) {
-        if (!queue.empty()) printFileTail(queue.front(), currentFileOffsets_[modID]);
-    }
-    printLog("Analysis Loop Finished.");
-}
 
 // ----------------------------------------------------------------------------
 // イベント処理 (画面更新 & ステータス管理)
