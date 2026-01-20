@@ -276,7 +276,6 @@ bool DetectorAnalyzer::syncDataStream(std::ifstream& ifs, long long& skippedByte
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
     if (offset == 0) {
         printLog("[OPENING] Mod " + std::to_string(modID) + ": " + fileName);
-        // currentRunPrefix_ は processBinaryFiles で管理するためここでは更新しない
     }
 
     std::ifstream ifs(fileName, std::ios::binary);
@@ -298,6 +297,10 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     size_t leftover = 0;
     unsigned long long lastT = currentBaseTime; 
 
+    // T0位置と、その時点のイベント数を記録するためのコンテナ
+    std::vector<size_t> t0_indices;
+    std::vector<size_t> t0_event_snapshots;
+
     ifs.read(buffer.data() + leftover, BUFFER_SIZE - leftover);
     size_t readCount = ifs.gcount();
     
@@ -311,7 +314,6 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             unsigned char h = buf[i];
             bool syncOK = false;
 
-            // 10個先までの同期チェック (既存ロジック維持)
             if (i + 80 > totalBytesInBuffer) {
                 if (h == 0x69 || h == 0x6a) syncOK = true;
             } else {
@@ -336,6 +338,10 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                         lastT = currentBaseTime;
                         moduleAliveTime_[modID] = currentBaseTime;
                         if (firstT0Time_ == 0) firstT0Time_ = s;
+
+                        // T0情報を記録
+                        t0_indices.push_back(i);
+                        t0_event_snapshots.push_back(rawEvents.size());
                     }
                 }
                 i += (syncOK ? 8 : 1);
@@ -352,16 +358,20 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
 
                     long long diff = (long long)(newTime - currentBaseTime);
                     if (std::abs(diff) > 1000000000LL) {
-                        if (diff > 0) { // Gap detected
+                        if (diff > 0) { 
                             deadTimeRanges_.push_back({currentBaseTime, newTime});
                             currentBaseTime = newTime;
                         }
-                        // Glitch (diff < 0) is ignored
                     } else {
                         currentBaseTime = newTime;
                     }
                     lastT = currentBaseTime;
                     moduleAliveTime_[modID] = currentBaseTime;
+
+                    // T0情報を記録
+                    t0_indices.push_back(i);
+                    t0_event_snapshots.push_back(rawEvents.size());
+                    
                     i += 8;
 
                 } else if (h == 0x6a) { // Event Data
@@ -373,23 +383,36 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                     int sys = det & 0xFF;
                     
                     if (mod < MAX_MODULES && sys < MAX_SYS_CH && ch_LUT[mod][sys].isValid) {
-                        // ★物理補正 & 負値チェック
                         if (tof >= pw) { 
                             unsigned long long eventT = currentBaseTime + (unsigned long long)(tof - pw);
                             lastT = eventT;
                             moduleAliveTime_[modID] = eventT;
-                            // ★RunID引数削除 (警告回避)
                             rawEvents.push_back({ ch_LUT[mod][sys].detTypeID, ch_LUT[mod][sys].strip, mod, eventT, (int)pw, sys });
                         }
-                        // else: tof < pw なので捨てる (iだけ進める)
                     }
                     i += 8;
                 } else { i += 8; }
             } else { i++; }
         }
         
-        // ★頂いたコード通り、読み込み数分だけオフセットを進める
-        offset += readCount; 
+        // T0アンカー方式によるオフセット更新判定
+        bool willBeEOF = (offset + readCount >= fileSize);
+
+        if (!willBeEOF && t0_indices.size() >= 2) {
+            // ファイル途中：最後のT0 (N-1) までを次回の読み出し位置にする
+            size_t lastT0Pos = t0_indices.back();
+            size_t snapshotSize = t0_event_snapshots.back();
+
+            offset += lastT0Pos;
+
+            // 最後のT0以降のイベントは次回に回すため、このバッファからは削除
+            if (rawEvents.size() > snapshotSize) {
+                rawEvents.resize(snapshotSize);
+            }
+        } else {
+            // ファイル末端：全て進める
+            offset += readCount;
+        }
         
     } else { offset = fileSize; }
 
@@ -405,7 +428,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
     std::map<int, unsigned long long> moduleLastTime;
     auto lastUIDraw = std::chrono::system_clock::now();
 
-    // 初期化
     for (auto const& [mod, q] : fileQueues) {
         moduleLastTime[mod] = 0; currentFileOffsets_[mod] = 0;
         hasSeenTimeHeaderMap_[mod] = false; baseTimeMap_[mod] = 0;
@@ -419,7 +441,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
     printSearchStatus();
 
     while (true) {
-        // A. ラン開始判定 (バリア)
         if (currentRunSignature.empty()) {
             for (auto const& [m, q] : fileQueues) {
                 if (!q.empty()) {
@@ -434,7 +455,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         }
         if (currentRunSignature.empty()) break;
 
-        // B. 読み込み (ラン不一致なら待機)
         int laggingMod = -1;
         unsigned long long minLastTime = std::numeric_limits<unsigned long long>::max();
         for (auto const& [m, q] : fileQueues) {
@@ -454,7 +474,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
         }
 
-        // C. 同期・解析
         if (!isAnalysisStarted_) {
             bool ready = true; unsigned long long maxBase = 0;
             for (auto const& [m, q] : fileQueues) {
@@ -473,10 +492,18 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         if (isAnalysisStarted_) {
             unsigned long long safeTime = getSafeTime(moduleLastTime);
             if (safeTime > lastSafeTime) {
-                if (safeTime - lastSafeTime < 10000000000ULL) totalEffectiveTimeNs_ += (safeTime - lastSafeTime);
+                if (safeTime - lastSafeTime < 10000000000ULL) {
+                    totalEffectiveTimeNs_ += (safeTime - lastSafeTime);
+                }
+
+                // 時間制限チェック
+                if (totalEffectiveTimeNs_ >= analysisDuration_ns_) {
+                    printLog("[LIMIT] Time limit reached. Stopping analysis loop.");
+                    break; 
+                }
+
                 lastSafeTime = safeTime; currentEventTime_ns_ = safeTime;
                 
-                // ★デッドタイム情報の整理: 現在時刻より古い情報は不要なので捨てる (メモリ節約 & 高速化)
                 while(!deadTimeRanges_.empty() && deadTimeRanges_.front().second < safeTime) {
                     deadTimeRanges_.erase(deadTimeRanges_.begin());
                 }
@@ -485,8 +512,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             for (auto& [m, buf] : moduleBuffers) {
                 while (!buf.empty() && buf.front().eventTime_ns <= safeTime) {
                     Event ev = std::move(buf.front()); buf.pop_front();
-                    
-                    // Veto処理
                     bool isDead = false;
                     for(const auto& r : deadTimeRanges_) {
                         if(ev.eventTime_ns >= r.first && ev.eventTime_ns <= r.second){ isDead=true; break;}
@@ -500,7 +525,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
         }
 
-        // D. バッファモニタ
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - lastUIDraw).count() > 500) {
             printSearchStatus();
             std::stringstream ss; ss << "\n Run: " << currentRunSignature << "\n";
@@ -513,7 +537,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             printLog(ss.str()); lastUIDraw = std::chrono::system_clock::now();
         }
 
-        // E. ラン終了判定
         bool runOver = true;
         for (auto const& [m, q] : fileQueues) if (!q.empty() && getRunSignature(q.front()) == currentRunSignature) runOver = false;
         for (auto const& [m, b] : moduleBuffers) if (!b.empty()) runOver = false;
@@ -523,6 +546,8 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         }
     }
 }
+
+
 
 bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
     if (sortedEvents.empty()) return true;
@@ -839,6 +864,7 @@ std::string DetectorAnalyzer::getRunSignature(const std::string& fileName) {
     }
     return parentDir + "::" + fileRunID;
 }
+
 
 short DetectorAnalyzer::getRunID(const std::string& prefix) {
     if (runPrefixToId_.count(prefix)) return runPrefixToId_[prefix];
