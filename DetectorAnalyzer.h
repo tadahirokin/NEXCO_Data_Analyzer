@@ -68,7 +68,6 @@ public:
         unsigned long long eventTime_ns;
         int tot;
         int sysCh;
-        short runID;
     };
 
     struct ChConfig {

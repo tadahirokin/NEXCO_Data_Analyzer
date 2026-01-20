@@ -276,12 +276,14 @@ bool DetectorAnalyzer::syncDataStream(std::ifstream& ifs, long long& skippedByte
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
     if (offset == 0) {
         printLog("[OPENING] Mod " + std::to_string(modID) + ": " + fileName);
-        currentRunPrefix_[modID] = getRunSignature(fileName);
+        // currentRunPrefix_ は processBinaryFiles で管理するためここでは更新しない
     }
-    short rid = getRunID(currentRunPrefix_[modID]); 
 
     std::ifstream ifs(fileName, std::ios::binary);
-    if (!ifs.is_open()) return {baseTimeMap_[modID], true};
+    if (!ifs.is_open()) {
+        printLog("[ERROR] Could not open file: " + fileName);
+        return {baseTimeMap_[modID], true};
+    }
 
     ifs.seekg(0, std::ios::end);
     long long fileSize = ifs.tellg();
@@ -309,7 +311,7 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             unsigned char h = buf[i];
             bool syncOK = false;
 
-            // 10個先までの同期チェック
+            // 10個先までの同期チェック (既存ロジック維持)
             if (i + 80 > totalBytesInBuffer) {
                 if (h == 0x69 || h == 0x6a) syncOK = true;
             } else {
@@ -323,15 +325,17 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             if (!hasSeenHeader) {
                 if (syncOK && h == 0x69) {
                     unsigned char* p = &buf[i+1];
-                    unsigned long long foundTime = (static_cast<unsigned long long>(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]) * 1000000000ULL +
-                                                   ((static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6)) * 1000000ULL +
-                                                   (((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6));
+                    unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                    unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
+                    unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
+                    unsigned long long foundTime = s * 1000000000ULL + ss * 1000000ULL + t;
 
                     if (foundTime > baseTimeMap_[modID]) {
                         currentBaseTime = foundTime;
                         hasSeenHeader = true; 
                         lastT = currentBaseTime;
                         moduleAliveTime_[modID] = currentBaseTime;
+                        if (firstT0Time_ == 0) firstT0Time_ = s;
                     }
                 }
                 i += (syncOK ? 8 : 1);
@@ -339,31 +343,54 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             }
 
             if (syncOK) {
-                if (h == 0x69) {
+                if (h == 0x69) { // T0 Header
                     unsigned char* p = &buf[i+1];
-                    unsigned long long newTime = (static_cast<unsigned long long>(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]) * 1000000000ULL +
-                                                 ((static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6)) * 1000000ULL +
-                                                 (((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6));
+                    unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                    unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
+                    unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
+                    unsigned long long newTime = s * 1000000000ULL + ss * 1000000ULL + t;
 
-                    // --- ジャンプ検知と現場ダンプ ---
                     long long diff = (long long)(newTime - currentBaseTime);
-                    if (std::abs(diff) > 1000000000LL) { 
-                        printLog("[WARNING] T0 Jump Detected! Delta: " + std::to_string((double)diff/1e9) + " s");
-                        // 先生のダンプ関数を呼び出し（前後を確認）
-                        printFileTail(fileName, offset + i);
+                    if (std::abs(diff) > 1000000000LL) {
+                        if (diff > 0) { // Gap detected
+                            deadTimeRanges_.push_back({currentBaseTime, newTime});
+                            currentBaseTime = newTime;
+                        }
+                        // Glitch (diff < 0) is ignored
+                    } else {
+                        currentBaseTime = newTime;
                     }
-
-                    currentBaseTime = newTime;
                     lastT = currentBaseTime;
                     moduleAliveTime_[modID] = currentBaseTime;
                     i += 8;
-                } else if (h == 0x6a) {
-                    // ... (イベント処理ロジック: 既存のまま) ...
+
+                } else if (h == 0x6a) { // Event Data
+                    unsigned char* p = &buf[i+1];
+                    unsigned int tof = (p[0] << 16) | (p[1] << 8) | p[2];
+                    unsigned int pw  = (p[3] << 12) | (p[4] << 4) | ((p[5] & 0xF0) >> 4);
+                    int det = ((p[5] & 0x0F) << 8) | p[6];
+                    int mod = (det >> 8) & 0xF;
+                    int sys = det & 0xFF;
+                    
+                    if (mod < MAX_MODULES && sys < MAX_SYS_CH && ch_LUT[mod][sys].isValid) {
+                        // ★物理補正 & 負値チェック
+                        if (tof >= pw) { 
+                            unsigned long long eventT = currentBaseTime + (unsigned long long)(tof - pw);
+                            lastT = eventT;
+                            moduleAliveTime_[modID] = eventT;
+                            // ★RunID引数削除 (警告回避)
+                            rawEvents.push_back({ ch_LUT[mod][sys].detTypeID, ch_LUT[mod][sys].strip, mod, eventT, (int)pw, sys });
+                        }
+                        // else: tof < pw なので捨てる (iだけ進める)
+                    }
                     i += 8;
                 } else { i += 8; }
             } else { i++; }
         }
-        offset += i;
+        
+        // ★頂いたコード通り、読み込み数分だけオフセットを進める
+        offset += readCount; 
+        
     } else { offset = fileSize; }
 
     baseTimeMap_[modID] = currentBaseTime;
@@ -372,136 +399,130 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
 }
 
 
-
 void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues) {
     const size_t PER_MOD_CAP = 1000000; 
     std::map<int, std::deque<Event>> moduleBuffers;
     std::map<int, unsigned long long> moduleLastTime;
     auto lastUIDraw = std::chrono::system_clock::now();
 
+    // 初期化
     for (auto const& [mod, q] : fileQueues) {
-        moduleLastTime[mod] = 0;
-        currentFileOffsets_[mod] = 0;
-        hasSeenTimeHeaderMap_[mod] = false;
-        baseTimeMap_[mod] = 0;
+        moduleLastTime[mod] = 0; currentFileOffsets_[mod] = 0;
+        hasSeenTimeHeaderMap_[mod] = false; baseTimeMap_[mod] = 0;
     }
-
-    isAnalysisStarted_ = false;
-    globalStartTimestamp_ = 0;
-    totalEffectiveTimeNs_ = 0; 
-    analysisStartTime_ = std::chrono::system_clock::now();
+    deadTimeRanges_.clear();
+    isAnalysisStarted_ = false; globalStartTimestamp_ = 0;
     
+    std::string currentRunSignature = ""; 
+    unsigned long long lastSafeTime = 0;
+
     printSearchStatus();
 
     while (true) {
-        bool anyFileLeft = false;
-        for (auto const& [m, q] : fileQueues) if (!q.empty()) anyFileLeft = true;
-        bool anyBufLeft = false;
-        for (auto const& [m, b] : moduleBuffers) if (!b.empty()) anyBufLeft = true;
-        
-        if (!anyFileLeft && !anyBufLeft) break;
+        // A. ラン開始判定 (バリア)
+        if (currentRunSignature.empty()) {
+            for (auto const& [m, q] : fileQueues) {
+                if (!q.empty()) {
+                    currentRunSignature = getRunSignature(q.front());
+                    printLog("=== STARTING RUN: " + currentRunSignature + " ===");
+                    currentRunStartTime_ = 0; lastGlobalAnalysisTime_ns_ = 0;
+                    isAnalysisStarted_ = false; deadTimeRanges_.clear(); 
+                    for(auto& [mod, t] : moduleLastTime) t = 0;
+                    break; 
+                }
+            }
+        }
+        if (currentRunSignature.empty()) break;
 
-        // --- 1. 読み込み ---
+        // B. 読み込み (ラン不一致なら待機)
         int laggingMod = -1;
         unsigned long long minLastTime = std::numeric_limits<unsigned long long>::max();
         for (auto const& [m, q] : fileQueues) {
-            if (q.empty()) continue; 
-            if (moduleLastTime[m] < minLastTime) {
-                minLastTime = moduleLastTime[m];
-                laggingMod = m;
-            }
+            if (q.empty() || getRunSignature(q.front()) != currentRunSignature) continue;
+            if (moduleLastTime[m] < minLastTime) { minLastTime = moduleLastTime[m]; laggingMod = m; }
         }
 
-        if (laggingMod != -1) {
-            std::string currentFile = fileQueues[laggingMod].front();
+        if (laggingMod != -1 && moduleBuffers[laggingMod].size() < PER_MOD_CAP) {
             std::vector<Event> temp;
-            auto res = readEventsFromFile(currentFile, laggingMod, temp, currentFileOffsets_[laggingMod]);
-            
-            if (moduleBuffers[laggingMod].size() < PER_MOD_CAP) {
-                for (auto& ev : temp) moduleBuffers[laggingMod].push_back(std::move(ev));
-            }
-            
-            if (res.first > moduleLastTime[laggingMod]) {
-                moduleLastTime[laggingMod] = res.first;
-            }
-
-            // EOF処理に詳細ログを追加
+            auto res = readEventsFromFile(fileQueues[laggingMod].front(), laggingMod, temp, currentFileOffsets_[laggingMod]);
+            for (auto& ev : temp) moduleBuffers[laggingMod].push_back(std::move(ev));
+            moduleLastTime[laggingMod] = res.first;
             if (res.second) {
-                printLog("[FINISHED_FILE] Mod " + std::to_string(laggingMod) + ": " + currentFile);
+                printLog("[FINISHED] Mod " + std::to_string(laggingMod) + ": " + fileQueues[laggingMod].front());
                 fileQueues[laggingMod].pop_front();
                 currentFileOffsets_[laggingMod] = 0;
-                
-                if (!fileQueues[laggingMod].empty()) {
-                    printLog("[NEXT_FILE_READY] Mod " + std::to_string(laggingMod) + ": " + fileQueues[laggingMod].front());
-                } else {
-                    printLog("[QUEUE_EMPTY] Mod " + std::to_string(laggingMod) + " has no more files.");
+            }
+        }
+
+        // C. 同期・解析
+        if (!isAnalysisStarted_) {
+            bool ready = true; unsigned long long maxBase = 0;
+            for (auto const& [m, q] : fileQueues) {
+                if (!moduleBuffers[m].empty() || (!q.empty() && getRunSignature(q.front()) == currentRunSignature)) {
+                    if (!hasSeenTimeHeaderMap_[m]) { ready = false; break; }
+                    maxBase = std::max(maxBase, baseTimeMap_[m]);
                 }
             }
-        }
-
-        // --- 2. 同期確定 ---
-        if (!isAnalysisStarted_) {
-            bool allHasT0 = true;
-            unsigned long long maxBaseT0 = 0;
-            for (auto const& [m, q] : fileQueues) {
-                if (!hasSeenTimeHeaderMap_[m]) { allHasT0 = false; break; }
-                maxBaseT0 = std::max(maxBaseT0, baseTimeMap_[m]);
-            }
-            if (allHasT0 && maxBaseT0 > 0) {
-                globalStartTimestamp_ = maxBaseT0;
-                isAnalysisStarted_ = true;
-                printLog("Synchronization Established at T0 = " + std::to_string(globalStartTimestamp_));
+            if (ready && maxBase > 0) {
+                globalStartTimestamp_ = maxBase; lastSafeTime = maxBase;
+                lastGlobalAnalysisTime_ns_ = maxBase; isAnalysisStarted_ = true;
+                printLog("Sync Established.");
             }
         }
 
-        // --- 3. 時間更新 & 終了判定 ---
-        if (isAnalysisStarted_) {
-            // 先生提供の getSafeTime を使用
-            unsigned long long safeTime = getSafeTime(moduleLastTime);
-            
-            if (safeTime > globalStartTimestamp_) {
-                currentEventTime_ns_ = safeTime;
-                totalEffectiveTimeNs_ = safeTime - globalStartTimestamp_;
-            }
-
-            if (analysisDuration_ns_ > 0 && totalEffectiveTimeNs_ >= analysisDuration_ns_) {
-                printLog("Limit Reached (SafeTime). Finishing Analysis.");
-                break;
-            }
-        }
-
-        // --- 4. 解析 ---
         if (isAnalysisStarted_) {
             unsigned long long safeTime = getSafeTime(moduleLastTime);
-
+            if (safeTime > lastSafeTime) {
+                if (safeTime - lastSafeTime < 10000000000ULL) totalEffectiveTimeNs_ += (safeTime - lastSafeTime);
+                lastSafeTime = safeTime; currentEventTime_ns_ = safeTime;
+                
+                // ★デッドタイム情報の整理: 現在時刻より古い情報は不要なので捨てる (メモリ節約 & 高速化)
+                while(!deadTimeRanges_.empty() && deadTimeRanges_.front().second < safeTime) {
+                    deadTimeRanges_.erase(deadTimeRanges_.begin());
+                }
+            }
             std::vector<Event> mergeChunk;
             for (auto& [m, buf] : moduleBuffers) {
                 while (!buf.empty() && buf.front().eventTime_ns <= safeTime) {
-                    Event ev = std::move(buf.front());
-                    buf.pop_front();
-                    if (ev.eventTime_ns >= globalStartTimestamp_) mergeChunk.push_back(std::move(ev));
+                    Event ev = std::move(buf.front()); buf.pop_front();
+                    
+                    // Veto処理
+                    bool isDead = false;
+                    for(const auto& r : deadTimeRanges_) {
+                        if(ev.eventTime_ns >= r.first && ev.eventTime_ns <= r.second){ isDead=true; break;}
+                    }
+                    if (!isDead && ev.eventTime_ns >= globalStartTimestamp_) mergeChunk.push_back(std::move(ev));
                 }
             }
-
             if (!mergeChunk.empty()) {
-                std::sort(mergeChunk.begin(), mergeChunk.end(), [](const Event& a, const Event& b){
-                    return a.eventTime_ns < b.eventTime_ns;
-                });
+                std::sort(mergeChunk.begin(), mergeChunk.end(), [](const Event& a, const Event& b){ return a.eventTime_ns < b.eventTime_ns; });
                 processChunk(mergeChunk);
             }
         }
 
-        auto nowLoop = std::chrono::system_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(nowLoop - lastUIDraw).count() > 500) {
+        // D. バッファモニタ
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - lastUIDraw).count() > 500) {
             printSearchStatus();
-            lastUIDraw = nowLoop;
+            std::stringstream ss; ss << "\n Run: " << currentRunSignature << "\n";
+            for(auto const& [m, b] : moduleBuffers) {
+                double usage = (double)b.size() / PER_MOD_CAP; if(usage>1.0) usage=1.0;
+                ss << " Mod " << m << " [";
+                for(int j=0; j<40; j++) ss << (j < usage*40 ? "█" : "░");
+                ss << "] " << std::fixed << std::setprecision(1) << usage*100.0 << "%\n";
+            }
+            printLog(ss.str()); lastUIDraw = std::chrono::system_clock::now();
+        }
+
+        // E. ラン終了判定
+        bool runOver = true;
+        for (auto const& [m, q] : fileQueues) if (!q.empty() && getRunSignature(q.front()) == currentRunSignature) runOver = false;
+        for (auto const& [m, b] : moduleBuffers) if (!b.empty()) runOver = false;
+        if (runOver) {
+            if(currentEventTime_ns_ > lastGlobalAnalysisTime_ns_) analyzeGainShift(currentEventTime_ns_);
+            currentRunSignature = "";
         }
     }
-    
-    printSearchStatus();
-    printLog("Analysis Completed.");
 }
-
 
 bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
     if (sortedEvents.empty()) return true;
@@ -509,12 +530,12 @@ bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
     for (size_t i = 0; i < sortedEvents.size(); ++i) {
         const auto& e = sortedEvents[i];
         
-        if (currentProcessingRunID_ != -1 && e.runID != currentProcessingRunID_) {
-            currentRunStartTime_ = 0; lastTimeoutCheckTime_ = 0;
-            channelLastRefHitTime_.clear(); moduleAliveTime_.clear(); prevEventTimeForEff_ = 0; 
-        }
-        currentProcessingRunID_ = e.runID;
+        // --- 削除するブロック (ここが runID を使っていた) ---
+        // if (currentProcessingRunID_ != -1 && e.runID != currentProcessingRunID_) { ... }
+        // currentProcessingRunID_ = e.runID;
+        // ------------------------------------------------
 
+        // ラン開始時の初期化 (ここは runID に依存せず tot で判定しているので維持)
         if (currentRunStartTime_ == 0) {
             if (e.tot >= 1000) {
                 currentRunStartTime_ = e.eventTime_ns;
@@ -527,24 +548,26 @@ bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
         currentEventTime_ns_ = e.eventTime_ns;
         moduleAliveTime_[e.module] = e.eventTime_ns;
 
+        // システム健全性チェックと実効時間加算
         bool isSystemHealthy = true;
         for (int mid : activeModuleIDs_) {
             if (moduleAliveTime_.find(mid) == moduleAliveTime_.end()) {
                 isSystemHealthy = false; break;
             }
         }
-        // 計数率の正確性のための厳格な時間加算
         if (isSystemHealthy && prevEventTimeForEff_ > 0) {
             unsigned long long dt_ns = e.eventTime_ns - prevEventTimeForEff_;
             if (dt_ns < 5000000000ULL) totalEffectiveTimeNs_ += dt_ns;
         }
         prevEventTimeForEff_ = e.eventTime_ns;
 
+        // ゲイン解析トリガー
         if (e.eventTime_ns >= lastGlobalAnalysisTime_ns_ + GAIN_ANALYSIS_WINDOW_NS) {
             analyzeGainShift(e.eventTime_ns);
             lastGlobalAnalysisTime_ns_ = e.eventTime_ns;
         }
 
+        // データ充填
         foundChannels_[{e.module, e.sysCh}].insert(e.strip);
         if (e.module < MAX_MODULES && e.sysCh < MAX_SYS_CH) {
             if (hGainCheck_LUT[e.module][e.sysCh]) hGainCheck_LUT[e.module][e.sysCh]->Fill((double)e.tot);
@@ -552,9 +575,9 @@ bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
         }
 
         b_type = e.type; b_strip = e.strip; b_time = (long long)e.eventTime_ns; b_tot = e.tot;
-        tree_->Fill();
+        if (tree_) tree_->Fill();
 
-        // N+7相関解析 (Slide 4)
+        // N+7 相関解析
         if (i > 0) {
             long long dt1 = (long long)e.eventTime_ns - (long long)sortedEvents[i-1].eventTime_ns;
             if (dt1 >= 0 && dt1 < 1000000) hDeltaT_Nearest->Fill((double)dt1);
@@ -670,34 +693,6 @@ int DetectorAnalyzer::findRightMostPeak(TH1F* hist) {
     return maxBin;
 }
 
-void DetectorAnalyzer::determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin) {
-    int nBins = hist->GetNbinsX();
-    const int SILENCE_BINS_5US = 250;
-    
-    outMinBin = 1;
-    int zeroCount = 0;
-    for (int i = peakBin; i > 1; --i) {
-        if (hist->GetBinContent(i) <= 0) zeroCount++;
-        else zeroCount = 0;
-        if (zeroCount >= SILENCE_BINS_5US) {
-            outMinBin = (i + zeroCount) - SILENCE_BINS_5US;
-            if (outMinBin < 1) outMinBin = 1;
-            break;
-        }
-    }
-
-    outMaxBin = nBins;
-    zeroCount = 0;
-    for (int i = peakBin; i < nBins; ++i) {
-        if (hist->GetBinContent(i) <= 0) zeroCount++;
-        else zeroCount = 0;
-        if (zeroCount >= SILENCE_BINS_5US) {
-            outMaxBin = (i - zeroCount) + SILENCE_BINS_5US;
-            if (outMaxBin > nBins) outMaxBin = nBins;
-            break; 
-        }
-    }
-}
 
 double DetectorAnalyzer::calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax) {
     int tBinMin = binMin + shiftBins;
@@ -718,143 +713,131 @@ double DetectorAnalyzer::calculateResidual(TH1F* hTarget, TH1F* hTemplate, int s
     return residualSum;
 }
 
-int DetectorAnalyzer::findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string& /*debugLabel*/) {
-    if (!hTarget || !hTemplate) return SHIFT_CALC_ERROR;
-    if (hTarget->Integral(binMin, binMax) < 10) return SHIFT_CALC_ERROR; 
-    
-    double minResidual = 1e20;
-    int bestShiftBins = SHIFT_CALC_ERROR;
-    bool found = false;
 
-    for (int s = -MATCHING_SEARCH_RANGE_BINS; s <= MATCHING_SEARCH_RANGE_BINS; ++s) {
-        double res = calculateResidual(hTarget, hTemplate, s, binMin, binMax);
-        if (res < 0) continue; 
-        if (res < minResidual) { minResidual = res; bestShiftBins = s; found = true; }
+// 5us (250bin) 空白探索
+void DetectorAnalyzer::determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin) {
+    int nBins = hist->GetNbinsX();
+    const int SILENCE_BINS = 250; 
+    
+    outMinBin = 1; int zeroCount = 0;
+    for (int i = peakBin; i > 1; --i) {
+        if (hist->GetBinContent(i) <= 0) zeroCount++; else zeroCount = 0;
+        if (zeroCount >= SILENCE_BINS) { outMinBin = i + zeroCount; if(outMinBin<1)outMinBin=1; break; }
     }
-    if (!found) return SHIFT_CALC_ERROR;
-    if (std::abs(bestShiftBins) == MATCHING_SEARCH_RANGE_BINS) return SHIFT_CALC_ERROR;
-    return bestShiftBins;
+    outMaxBin = nBins; zeroCount = 0;
+    for (int i = peakBin; i < nBins; ++i) {
+        if (hist->GetBinContent(i) <= 0) zeroCount++; else zeroCount = 0;
+        if (zeroCount >= SILENCE_BINS) { outMaxBin = i - zeroCount; if(outMaxBin>nBins)outMaxBin=nBins; break; }
+    }
+}
+
+// マッチング (端に当たったらエラー)
+int DetectorAnalyzer::findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string&) {
+    double minRes = 1e20; int bestS = SHIFT_CALC_ERROR; bool found = false;
+    const int SEARCH_RANGE = 25; // ±500ns
+
+    for (int s = -SEARCH_RANGE; s <= SEARCH_RANGE; ++s) { 
+        double res = calculateResidual(hTarget, hTemplate, s, binMin, binMax);
+        if (res >= 0 && res < minRes) { minRes = res; bestS = s; found = true; }
+    }
+    if (!found || std::abs(bestS) == SEARCH_RANGE) return SHIFT_CALC_ERROR;
+    return bestS;
 }
 
 bool DetectorAnalyzer::analyzeGainShift(unsigned long long currentTime_ns) { 
     if (!gainLogCsv_.is_open()) return true;
-
     if (!isCsvHeaderWritten_) {
+        // (ヘッダ書き込み: 既存ママ)
         struct SortInfo { std::pair<int,int> k; int t; int s; std::string n; };
         std::vector<SortInfo> sorted;
         for (auto const& [keyPair, info] : detConfigMap_) sorted.push_back({keyPair, info.detTypeID, info.strip, info.cachedName});
-        std::sort(sorted.begin(), sorted.end(), [](const SortInfo& a, const SortInfo& b){
-            if(a.t != b.t) return a.t < b.t; return a.s < b.s;
-        });
+        std::sort(sorted.begin(), sorted.end(), [](const SortInfo& a, const SortInfo& b){ if(a.t != b.t) return a.t < b.t; return a.s < b.s; });
         gainLogCsv_ << "Time_ns"; rateLogCsv_ << "Time_ns";
-        for(const auto& s : sorted) {
-            std::string label = s.n + "-" + std::to_string(s.s);
-            gainLogCsv_ << "," << label; rateLogCsv_ << "," << label;
-        }
+        for(const auto& s : sorted) { std::string label = s.n + "-" + std::to_string(s.s); gainLogCsv_ << "," << label; rateLogCsv_ << "," << label; }
         gainLogCsv_ << "\n"; rateLogCsv_ << "\n";
         isCsvHeaderWritten_ = true;
     }
 
     gainLogCsv_ << currentTime_ns; rateLogCsv_ << currentTime_ns;
-    
+    double durMin = (double)GAIN_ANALYSIS_WINDOW_NS / 1.0e9 / 60.0; // 10分
+
     std::vector<std::pair<int, int>> sortedKeys;
     for (auto const& [key, info] : detConfigMap_) sortedKeys.push_back(key);
     std::sort(sortedKeys.begin(), sortedKeys.end(), [&](std::pair<int,int> a, std::pair<int,int> b){
         const auto& iA = detConfigMap_[a]; const auto& iB = detConfigMap_[b];
-        if(iA.detTypeID != iB.detTypeID) return iA.detTypeID < iB.detTypeID;
-        return iA.strip < iB.strip; 
+        if(iA.detTypeID != iB.detTypeID) return iA.detTypeID < iB.detTypeID; return iA.strip < iB.strip; 
     });
 
-    if (!isTemplateCaptured_) {
-        for (const auto& key : sortedKeys) {
-            int m = key.first; int c = key.second;
-            cumulativeShiftMap_[key] = 0.0; 
-            if (hGainCheck_LUT[m][c] && hGainCheck_LUT[m][c]->GetEntries() > 50) {
-                int peakBin = findRightMostPeak(hGainCheck_LUT[m][c]);
-                int rMin = 0, rMax = 0;
-                determineIntegrationRange(hGainCheck_LUT[m][c], peakBin, rMin, rMax);
-                rangeMinMap_[key] = rMin; rangeMaxMap_[key] = rMax;
-                std::string tName = std::string(hGainCheck_LUT[m][c]->GetName()) + "_tmpl";
-                if (templateHists_.count(key)) delete templateHists_[key];
-                templateHists_[key] = (TH1F*)hGainCheck_LUT[m][c]->Clone(tName.c_str());
-                templateHists_[key]->SetDirectory(0);
-            }
-            gainLogCsv_ << ",0";
-            double rate = 0;
-            if (hGainCheck_LUT[m][c]) {
-                int rMin = rangeMinMap_[key]; int rMax = rangeMaxMap_[key];
-                if (rMin > 0 && rMax > rMin) rate = hGainCheck_LUT[m][c]->Integral(rMin, rMax) / (double)(GAIN_ANALYSIS_WINDOW_NS / 1.0e9);
-                hGainCheck_LUT[m][c]->Reset();
-            }
-            rateLogCsv_ << "," << rate;
-        }
-        isTemplateCaptured_ = true;
-    } 
-    else {
-        for (const auto& key : sortedKeys) {
-            int m = key.first; int c = key.second;
-            std::string csvVal = "ND";
-            double peakRate = 0.0;
-            
-            if (hGainCheck_LUT[m][c]) {
-                TH1F* hist = hGainCheck_LUT[m][c];
-                if (templateHists_.count(key) && hist->GetEntries() > 50) {
-                    int rMin = rangeMinMap_[key]; int rMax = rangeMaxMap_[key];
-                    std::string label = detConfigMap_[key].cachedName;
-                    int deltaBins = findBestShift(hist, templateHists_[key], rMin, rMax, label);
-                    
-                    if (deltaBins != SHIFT_CALC_ERROR) {
-                        rangeMinMap_[key] += deltaBins; rangeMaxMap_[key] += deltaBins;
-                        double deltaNS = (double)deltaBins * BIN_WIDTH_NS;
-                        cumulativeShiftMap_[key] += deltaNS;
-                        csvVal = std::to_string(cumulativeShiftMap_[key]);
+    for (const auto& key : sortedKeys) {
+        TH1F* hist = hGainCheck_LUT[key.first][key.second];
+        std::string sVal = "ND"; double rVal = 0.0;
 
-                        delete templateHists_[key];
-                        std::string tName = std::string(hist->GetName()) + "_tmpl";
-                        templateHists_[key] = (TH1F*)hist->Clone(tName.c_str());
-                        templateHists_[key]->SetDirectory(0);
-                        
-                        peakRate = hist->Integral(rangeMinMap_[key], rangeMaxMap_[key]) / (double)(GAIN_ANALYSIS_WINDOW_NS / 1.0e9);
-                    } else {
-                        peakRate = hist->Integral(rMin, rMax) / (double)(GAIN_ANALYSIS_WINDOW_NS / 1.0e9);
-                    }
-                } else {
-                    if (rangeMinMap_[key] > 0) peakRate = hist->Integral(rangeMinMap_[key], rangeMaxMap_[key]) / (double)(GAIN_ANALYSIS_WINDOW_NS / 1.0e9);
-                }
+        if (hist) {
+            // カウントによるND判定は行わない (ご指示通り)
+            
+            if (!isTemplateCaptured_) {
+                // 初回
+                int pBin = findRightMostPeak(hist); int rMin, rMax;
+                determineIntegrationRange(hist, pBin, rMin, rMax);
+                rangeMinMap_[key] = rMin; rangeMaxMap_[key] = rMax;
                 
-                if (csvVal != "ND" && gainEvolutionGraphs_.count(key)) {
-                    TGraph* g = gainEvolutionGraphs_[key];
-                    g->SetPoint(g->GetN(), (double)currentTime_ns, cumulativeShiftMap_[key]);
+                templateHists_[key] = (TH1F*)hist->Clone(Form("%s_tmpl", hist->GetName()));
+                templateHists_[key]->SetDirectory(0);
+                
+                cumulativeShiftMap_[key] = 0.0; sVal = "0";
+                if(rMin>0 && rMax>rMin) rVal = hist->Integral(rMin, rMax) / durMin;
+            } else {
+                // 2回目以降
+                int dBin = findBestShift(hist, templateHists_[key], rangeMinMap_[key], rangeMaxMap_[key], "");
+                
+                if (dBin != SHIFT_CALC_ERROR) {
+                    if (dBin != 0) {
+                        rangeMinMap_[key] += dBin; rangeMaxMap_[key] += dBin;
+                        cumulativeShiftMap_[key] += (double)dBin * 20.0;
+                        delete templateHists_[key];
+                        templateHists_[key] = (TH1F*)hist->Clone(Form("%s_tmpl", hist->GetName()));
+                        templateHists_[key]->SetDirectory(0);
+                    }
+                    sVal = std::to_string(cumulativeShiftMap_[key]);
+                    rVal = hist->Integral(rangeMinMap_[key], rangeMaxMap_[key]) / durMin;
+                } else {
+                    // マッチング失敗時のみ ND
+                    sVal = "ND"; 
+                    rVal = 0.0; // あるいは前回値を維持するか、NDなら0にするか。ここでは0にします。
                 }
-                if (rateEvolutionGraphs_.count(key)) {
-                    TGraph* gr = rateEvolutionGraphs_[key];
-                    gr->SetPoint(gr->GetN(), (double)currentTime_ns, peakRate);
-                }
-                hist->Reset();
             }
-            gainLogCsv_ << "," << csvVal; rateLogCsv_ << "," << peakRate;
+
+            if(sVal != "ND") {
+                if(gainEvolutionGraphs_.count(key)) gainEvolutionGraphs_[key]->SetPoint(gainEvolutionGraphs_[key]->GetN(), (double)currentTime_ns, cumulativeShiftMap_[key]);
+                if(rateEvolutionGraphs_.count(key)) rateEvolutionGraphs_[key]->SetPoint(rateEvolutionGraphs_[key]->GetN(), (double)currentTime_ns, rVal);
+            }
+            hist->Reset();
         }
+        gainLogCsv_ << "," << sVal; rateLogCsv_ << "," << rVal;
     }
     gainLogCsv_ << std::endl; rateLogCsv_ << std::endl;
+    if(!isTemplateCaptured_) isTemplateCaptured_ = true;
     return true; 
 }
+
 
 // ----------------------------------------------------------------------------
 // ユーティリティ
 // ----------------------------------------------------------------------------
 
-
-
-
-
 std::string DetectorAnalyzer::getRunSignature(const std::string& fileName) {
-    std::string fname = fileName;
-    size_t lastSlash = fileName.find_last_of("/\\");
-    if (lastSlash != std::string::npos) fname = fileName.substr(lastSlash + 1);
+    namespace fs = std::filesystem;
+    fs::path p(fileName);
+    std::string parentDir = p.parent_path().string();
+    std::string filenameStr = p.filename().string();
+    
     static std::regex run_re(R"((PSD\d+_\d+))");
     std::smatch match;
-    if (std::regex_search(fname, match, run_re)) return match[1].str();
-    return "";
+    std::string fileRunID = "UnknownID";
+    if (std::regex_search(filenameStr, match, run_re)) {
+        fileRunID = match[1].str();
+    }
+    return parentDir + "::" + fileRunID;
 }
 
 short DetectorAnalyzer::getRunID(const std::string& prefix) {
