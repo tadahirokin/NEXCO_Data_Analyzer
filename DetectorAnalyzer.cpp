@@ -113,6 +113,7 @@ DetectorAnalyzer::DetectorAnalyzer(int timeWindow_ns, const std::string& outputF
 // ----------------------------------------------------------------------------
 // デストラクタ
 // ----------------------------------------------------------------------------
+
 DetectorAnalyzer::~DetectorAnalyzer() {
     if (currentEventTime_ns_ > lastGlobalAnalysisTime_ns_) {
         analyzeGainShift(currentEventTime_ns_);
@@ -124,6 +125,11 @@ DetectorAnalyzer::~DetectorAnalyzer() {
         outputFile_->cd();
         if (tree_) tree_->Write();
         
+        // ★修正: Canvas生成ループを廃止し、データ(TH1F)を直接保存
+        
+        if (!outputFile_->GetDirectory("Histograms")) outputFile_->mkdir("Histograms");
+        outputFile_->cd("Histograms");
+
         std::vector<std::pair<int, int>> sortedKeys;
         for (auto const& [key, info] : detConfigMap_) sortedKeys.push_back(key);
         std::sort(sortedKeys.begin(), sortedKeys.end(), [&](std::pair<int,int> a, std::pair<int,int> b){
@@ -133,38 +139,11 @@ DetectorAnalyzer::~DetectorAnalyzer() {
             return iA.strip < iB.strip; 
         });
 
-        if (!outputFile_->GetDirectory("LogScalePlots")) outputFile_->mkdir("LogScalePlots");
-        if (!outputFile_->GetDirectory("LinearScalePlots")) outputFile_->mkdir("LinearScalePlots");
-
         for (const auto& key : sortedKeys) {
             TH1F* hist = hRawToTMap[key];
-            if (!hist || hist->GetEntries() < 10) continue;
-            
-            // 積分範囲の塗りつぶし用
-            TH1F* hHL = nullptr;
-            if (rangeMinMap_.count(key) && rangeMaxMap_.count(key)) {
-                double minNS = (double)rangeMinMap_[key] * BIN_WIDTH_NS;
-                double maxNS = (double)(rangeMaxMap_[key] + 1) * BIN_WIDTH_NS;
-                
-                int b1 = hist->FindBin(minNS);
-                int b2 = hist->FindBin(maxNS);
-                
-                hHL = (TH1F*)hist->Clone(Form("%s_hl", hist->GetName()));
-                hHL->Reset();
-                for (int b = b1; b <= b2; ++b) hHL->SetBinContent(b, hist->GetBinContent(b));
-                hHL->SetFillColor(kYellow); hHL->SetLineColor(kBlack);
-            }
-
-            outputFile_->cd("LinearScalePlots");
-            TCanvas cLin(Form("c_lin_%s", hist->GetName()), hist->GetTitle());
-            hist->Draw(); if (hHL) hHL->Draw("SAME HIST"); hist->Draw("SAME AXIS"); cLin.Write();
-
-            outputFile_->cd("LogScalePlots");
-            TCanvas cLog(Form("c_log_%s", hist->GetName()), hist->GetTitle());
-            cLog.SetLogy(); hist->SetMinimum(0.5);
-            hist->Draw(); if (hHL) hHL->Draw("SAME HIST"); hist->Draw("SAME AXIS"); cLog.Write();
-
-            if (hHL) delete hHL;
+            if (!hist) continue;
+            // ゲートで弾かれてエントリが0でも、存在確認のため一応保存する設定に変更（必要に応じて entries > 0 にしてください）
+            hist->Write();
         }
 
         outputFile_->cd();
@@ -273,6 +252,40 @@ bool DetectorAnalyzer::syncDataStream(std::ifstream& ifs, long long& skippedByte
 }
 
 
+
+
+
+
+// ----------------------------------------------------------------------------
+// 修正対象 1: Treeの定義 (データ型最適化)
+// ----------------------------------------------------------------------------
+void DetectorAnalyzer::setupTree() {
+    outputFile_->cd();
+    // Tree名を変更せず、構造のみ最適化
+    tree_ = new TTree("Events", "Raw Detector Hits");
+
+    // type(1byte), strip(1byte), tot(4bytes), time(8bytes:相対時間)
+    tree_->Branch("type",  &b_type,  "type/B");   // Char_t
+    tree_->Branch("strip", &b_strip, "strip/B");  // Char_t
+    tree_->Branch("tot",   &b_tot,   "tot/I");    // Int_t (100,000ns対応)
+    tree_->Branch("time",  &b_time,  "time/L");   // Long64_t
+
+    // ヒストグラム定義は変更なし
+    hDeltaT_Nearest = new TH1F("DeltaT_Nearest", "Delta T (Nearest Neighbor);Delta T [ns];Counts / ns", 100000, 0, 100000);
+    hDeltaT_n8 = new TH1F("DeltaT_n_plus_7", "Delta T (N to N+7);Delta T [ns];Counts / ns", 100000, 0, 100000);
+    hGlobalPIndexMap = new TH1F("GlobalHitMap_PIndex", "Global Hit Count vs P-Index;P-index;Total Counts", 600, 0, 600);
+    
+    gT0Check = new TGraph();
+    gT0Check->SetName("T0_Check");
+    gT0Check->SetTitle("T0 Linearity Check;Count;Time Elapsed [s]");
+    gT0Check->SetMarkerStyle(20);
+    gT0Check->SetMarkerSize(0.5);
+    gT0Check->SetMarkerColor(kRed);
+}
+
+// ----------------------------------------------------------------------------
+// 修正対象 2: ファイル読み込み (T0アンカー方式)
+// ----------------------------------------------------------------------------
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
     if (offset == 0) {
         printLog("[OPENING] Mod " + std::to_string(modID) + ": " + fileName);
@@ -297,9 +310,9 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     size_t leftover = 0;
     unsigned long long lastT = currentBaseTime; 
 
-    // T0位置と、その時点のイベント数を記録するためのコンテナ
-    std::vector<size_t> t0_indices;
-    std::vector<size_t> t0_event_snapshots;
+    // ★追加: T0アンカー処理用の記録コンテナ
+    std::vector<size_t> t0_indices;           
+    std::vector<size_t> t0_event_snapshots;   
 
     ifs.read(buffer.data() + leftover, BUFFER_SIZE - leftover);
     size_t readCount = ifs.gcount();
@@ -338,8 +351,8 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                         lastT = currentBaseTime;
                         moduleAliveTime_[modID] = currentBaseTime;
                         if (firstT0Time_ == 0) firstT0Time_ = s;
-
-                        // T0情報を記録
+                        
+                        // ★記録: 最初のT0
                         t0_indices.push_back(i);
                         t0_event_snapshots.push_back(rawEvents.size());
                     }
@@ -367,11 +380,11 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                     }
                     lastT = currentBaseTime;
                     moduleAliveTime_[modID] = currentBaseTime;
-
-                    // T0情報を記録
+                    
+                    // ★記録: T0発見
                     t0_indices.push_back(i);
                     t0_event_snapshots.push_back(rawEvents.size());
-                    
+
                     i += 8;
 
                 } else if (h == 0x6a) { // Event Data
@@ -395,22 +408,22 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             } else { i++; }
         }
         
-        // T0アンカー方式によるオフセット更新判定
+        // ★変更: T0アンカー方式によるオフセット更新ロジック
         bool willBeEOF = (offset + readCount >= fileSize);
 
         if (!willBeEOF && t0_indices.size() >= 2) {
-            // ファイル途中：最後のT0 (N-1) までを次回の読み出し位置にする
+            // Case A: ファイル途中なら、最後のT0 (N-1) まで進めて、データもそこまでで切る
             size_t lastT0Pos = t0_indices.back();
             size_t snapshotSize = t0_event_snapshots.back();
 
             offset += lastT0Pos;
 
-            // 最後のT0以降のイベントは次回に回すため、このバッファからは削除
+            // 最後のT0以降のイベントは破棄 (次回読み直し)
             if (rawEvents.size() > snapshotSize) {
                 rawEvents.resize(snapshotSize);
             }
         } else {
-            // ファイル末端：全て進める
+            // Case B: ファイル末端 または T0不足なら全部進める
             offset += readCount;
         }
         
@@ -421,7 +434,9 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     return {lastT, (offset >= fileSize)}; 
 }
 
-
+// ----------------------------------------------------------------------------
+// 修正対象 3: 全体ループ処理 (時間制限チェック追加)
+// ----------------------------------------------------------------------------
 void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues) {
     const size_t PER_MOD_CAP = 1000000; 
     std::map<int, std::deque<Event>> moduleBuffers;
@@ -496,7 +511,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
                     totalEffectiveTimeNs_ += (safeTime - lastSafeTime);
                 }
 
-                // 時間制限チェック
+                // ★追加: 時間制限チェック
                 if (totalEffectiveTimeNs_ >= analysisDuration_ns_) {
                     printLog("[LIMIT] Time limit reached. Stopping analysis loop.");
                     break; 
@@ -512,6 +527,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             for (auto& [m, buf] : moduleBuffers) {
                 while (!buf.empty() && buf.front().eventTime_ns <= safeTime) {
                     Event ev = std::move(buf.front()); buf.pop_front();
+                    
                     bool isDead = false;
                     for(const auto& r : deadTimeRanges_) {
                         if(ev.eventTime_ns >= r.first && ev.eventTime_ns <= r.second){ isDead=true; break;}
@@ -547,20 +563,16 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
     }
 }
 
-
-
+// ----------------------------------------------------------------------------
+// 修正対象 4: Chunk処理 (型キャストと相対時間)
+// ----------------------------------------------------------------------------
 bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
     if (sortedEvents.empty()) return true;
 
     for (size_t i = 0; i < sortedEvents.size(); ++i) {
         const auto& e = sortedEvents[i];
         
-        // --- 削除するブロック (ここが runID を使っていた) ---
-        // if (currentProcessingRunID_ != -1 && e.runID != currentProcessingRunID_) { ... }
-        // currentProcessingRunID_ = e.runID;
-        // ------------------------------------------------
-
-        // ラン開始時の初期化 (ここは runID に依存せず tot で判定しているので維持)
+        // ラン開始時の初期化 (元コード維持: ゲートは残しています)
         if (currentRunStartTime_ == 0) {
             if (e.tot >= 1000) {
                 currentRunStartTime_ = e.eventTime_ns;
@@ -573,7 +585,6 @@ bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
         currentEventTime_ns_ = e.eventTime_ns;
         moduleAliveTime_[e.module] = e.eventTime_ns;
 
-        // システム健全性チェックと実効時間加算
         bool isSystemHealthy = true;
         for (int mid : activeModuleIDs_) {
             if (moduleAliveTime_.find(mid) == moduleAliveTime_.end()) {
@@ -586,23 +597,25 @@ bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
         }
         prevEventTimeForEff_ = e.eventTime_ns;
 
-        // ゲイン解析トリガー
         if (e.eventTime_ns >= lastGlobalAnalysisTime_ns_ + GAIN_ANALYSIS_WINDOW_NS) {
             analyzeGainShift(e.eventTime_ns);
             lastGlobalAnalysisTime_ns_ = e.eventTime_ns;
         }
 
-        // データ充填
         foundChannels_[{e.module, e.sysCh}].insert(e.strip);
         if (e.module < MAX_MODULES && e.sysCh < MAX_SYS_CH) {
             if (hGainCheck_LUT[e.module][e.sysCh]) hGainCheck_LUT[e.module][e.sysCh]->Fill((double)e.tot);
             if (hRawToT_LUT[e.module][e.sysCh]) hRawToT_LUT[e.module][e.sysCh]->Fill((double)e.tot);
         }
 
-        b_type = e.type; b_strip = e.strip; b_time = (long long)e.eventTime_ns; b_tot = e.tot;
+        // ★修正: 新しい型定義に合わせてキャストし、相対時間を格納
+        b_type = static_cast<Char_t>(e.type);
+        b_strip = static_cast<Char_t>(e.strip);
+        b_tot = static_cast<Int_t>(e.tot);
+        b_time = static_cast<Long64_t>(e.eventTime_ns - globalStartTimestamp_);
+        
         if (tree_) tree_->Fill();
 
-        // N+7 相関解析
         if (i > 0) {
             long long dt1 = (long long)e.eventTime_ns - (long long)sortedEvents[i-1].eventTime_ns;
             if (dt1 >= 0 && dt1 < 1000000) hDeltaT_Nearest->Fill((double)dt1);
@@ -614,6 +627,8 @@ bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
     }
     return true;
 }
+
+
 
 
 void DetectorAnalyzer::printSearchStatus() {
@@ -1100,25 +1115,7 @@ void DetectorAnalyzer::setTimeLimitMinutes(double minutes) {
     }
 }
 
-void DetectorAnalyzer::setupTree() {
-    outputFile_->cd();
-    tree_ = new TTree("Events", "Raw Detector Hits");
-    tree_->Branch("type",  &b_type,  "type/I");   
-    tree_->Branch("strip", &b_strip, "strip/I");  
-    tree_->Branch("time",  &b_time,  "time/L");   
-    tree_->Branch("tot",   &b_tot,   "tot/I");    
 
-    hDeltaT_Nearest = new TH1F("DeltaT_Nearest", "Delta T (Nearest Neighbor);Delta T [ns];Counts / ns", 100000, 0, 100000);
-    hDeltaT_n8 = new TH1F("DeltaT_n_plus_7", "Delta T (N to N+7);Delta T [ns];Counts / ns", 100000, 0, 100000);
-    hGlobalPIndexMap = new TH1F("GlobalHitMap_PIndex", "Global Hit Count vs P-Index;P-index;Total Counts", 600, 0, 600);
-    
-    gT0Check = new TGraph();
-    gT0Check->SetName("T0_Check");
-    gT0Check->SetTitle("T0 Linearity Check;Count;Time Elapsed [s]");
-    gT0Check->SetMarkerStyle(20);
-    gT0Check->SetMarkerSize(0.5);
-    gT0Check->SetMarkerColor(kRed);
-}
 
 void DetectorAnalyzer::calculateEffectiveTime() {
     double liveTimeSec = (double)totalEffectiveTimeNs_ / 1.0e9;

@@ -94,7 +94,7 @@ public:
     void processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues);
 
     void printSearchStatus();
-    bool isAnalysisStarted_; // 解析が実際に開始されたかどうかのフラグ
+    bool isAnalysisStarted_; 
 
 private:
 
@@ -112,17 +112,14 @@ private:
     
     // ゲイン解析ロジック
     bool analyzeGainShift(unsigned long long currentTime_ns);
-    int findRightMostPeak(TH1F* hist); // ビン番号を返すように変更
+    int findRightMostPeak(TH1F* hist); 
     void determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin);
     
-    // ★復元: 実装ファイルにあるため宣言が必要
     double calculatePeakAreaCovell(TH1F* hist, double peakPos);
-
     double calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax);
     int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string& debugLabel);
     
     void printFileTail(const std::string& filePath, long long currentOffset);
-
     void calculateEffectiveTime();
 
     // メンバ変数
@@ -134,13 +131,16 @@ private:
     int t0GlobalCount_;
     unsigned long long firstT0Time_;
 
-    int b_type, b_strip, b_tot;
-    long long b_time;
+    // ★最適化: TTree用のバッファ変数
+    Char_t   b_type;   // 1byte
+    Char_t   b_strip;  // 1byte
+    Int_t    b_tot;    // 4byte (100,000対応)
+    Long64_t b_time;   // 8byte (相対時間用)
 
     unsigned long long analysisDuration_ns_;
     unsigned long long globalStartTimestamp_;
     unsigned long long currentEventTime_ns_;
-    unsigned long long lastGlobalAnalysisTime_ns_; // 相対時刻トリガー用
+    unsigned long long lastGlobalAnalysisTime_ns_; 
     
     bool isFirstGainAnalysis_;
     bool isCsvHeaderWritten_;
@@ -179,7 +179,6 @@ private:
     std::map<int, unsigned long long> baseTimeMap_;
     std::map<int, bool> hasSeenTimeHeaderMap_;
 
-    // ★追加: デッドタイム（信頼性欠損区間）リスト
     std::vector<std::pair<unsigned long long, unsigned long long>> deadTimeRanges_;
 
     std::ofstream gainLogCsv_;
@@ -200,10 +199,9 @@ private:
     std::map<std::pair<int, int>, TGraph*> gainEvolutionGraphs_;
     std::map<std::pair<int, int>, TGraph*> rateEvolutionGraphs_;
     
-    // 内部状態管理
-    std::map<std::pair<int, int>, double> cumulativeShiftMap_; // 互換性維持のためdouble(ns)
-    std::map<std::pair<int, int>, int> rangeMinMap_; // int (ビン番号)
-    std::map<std::pair<int, int>, int> rangeMaxMap_; // int (ビン番号)
+    std::map<std::pair<int, int>, double> cumulativeShiftMap_; 
+    std::map<std::pair<int, int>, int> rangeMinMap_; 
+    std::map<std::pair<int, int>, int> rangeMaxMap_; 
 };
 
 #endif
