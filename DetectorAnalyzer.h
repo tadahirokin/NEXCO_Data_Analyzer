@@ -95,8 +95,10 @@ public:
     void processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues);
 
     void printSearchStatus();
+    bool isAnalysisStarted_; // 解析が実際に開始されたかどうかのフラグ
 
 private:
+
     void setupTree();
     
     // 同期・読み込み
@@ -177,6 +179,9 @@ private:
     std::map<int, long long> currentFileOffsets_;
     std::map<int, unsigned long long> baseTimeMap_;
     std::map<int, bool> hasSeenTimeHeaderMap_;
+
+    // ★追加: デッドタイム（信頼性欠損区間）リスト
+    std::vector<std::pair<unsigned long long, unsigned long long>> deadTimeRanges_;
 
     std::ofstream gainLogCsv_;
     std::ofstream rateLogCsv_;

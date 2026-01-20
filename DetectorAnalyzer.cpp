@@ -274,17 +274,15 @@ bool DetectorAnalyzer::syncDataStream(std::ifstream& ifs, long long& skippedByte
 
 
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
-    // --- 復活させたオープンログ ---
     if (offset == 0) {
         printLog("[OPENING] Mod " + std::to_string(modID) + ": " + fileName);
         currentRunPrefix_[modID] = getRunSignature(fileName);
     }
-    
     short rid = getRunID(currentRunPrefix_[modID]); 
 
     std::ifstream ifs(fileName, std::ios::binary);
     if (!ifs.is_open()) {
-        printLog("[ERROR] Could not open: " + fileName);
+        printLog("[ERROR] Could not open file: " + fileName);
         return {baseTimeMap_[modID], true};
     }
 
@@ -325,26 +323,24 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             }
 
             if (!hasSeenHeader) {
-                if (syncOK) {
-                    if (h == 0x69) {
-                        unsigned char* p = &buf[i+1];
-                        unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-                        unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
-                        unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
-                        unsigned long long foundTime = s * 1000000000ULL + ss * 1000000ULL + t;
+                if (syncOK && h == 0x69) {
+                    unsigned char* p = &buf[i+1];
+                    unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                    unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
+                    unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
+                    unsigned long long foundTime = s * 1000000000ULL + ss * 1000000ULL + t;
 
-                        if (foundTime > baseTimeMap_[modID]) {
-                            if (ss < 1000 && t < 50) {
-                                currentBaseTime = foundTime;
-                                hasSeenHeader = true; 
-                                lastT = currentBaseTime;
-                                moduleAliveTime_[modID] = currentBaseTime;
-                                if (firstT0Time_ == 0) firstT0Time_ = s;
-                            }
+                    if (foundTime > baseTimeMap_[modID]) {
+                        if (ss < 1000 && t < 50) {
+                            currentBaseTime = foundTime;
+                            hasSeenHeader = true; 
+                            lastT = currentBaseTime;
+                            moduleAliveTime_[modID] = currentBaseTime;
+                            if (firstT0Time_ == 0) firstT0Time_ = s;
                         }
-                    } 
-                    i += 8; 
-                } else { i++; }
+                    }
+                }
+                i += (syncOK ? 8 : 1);
                 continue; 
             }
 
@@ -356,18 +352,28 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                     unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
                     unsigned long long newTime = s * 1000000000ULL + ss * 1000000ULL + t;
 
-                    // T0ジャンプ監視
                     long long diff = (long long)(newTime - currentBaseTime);
-                    if (std::abs(diff) > 1000000000LL) { 
-                        printLog("[WARNING] T0 Jump Detected! Mod " + std::to_string(modID) + 
-                                 " Delta: " + std::to_string(diff) + " ns (" + 
-                                 std::to_string((double)diff/1e9) + " sec).");
+                    if (std::abs(diff) > 1000000000LL) {
+                        if (diff < 0) {
+                            printLog("[GLITCH_DETECTED] Mod " + std::to_string(modID) + 
+                                     " | Delta: " + std::to_string((double)diff/1e9) + " s (IGNORED)");
+                            printFileTail(fileName, offset + i);
+                            i += 8; continue; 
+                        } else {
+                            printLog("[GAP_DETECTED] Mod " + std::to_string(modID) + 
+                                     " | Delta: " + std::to_string((double)diff/1e9) + " s (REGISTERED)");
+                            deadTimeRanges_.push_back({currentBaseTime, newTime});
+                            currentBaseTime = newTime;
+                            lastT = currentBaseTime;
+                            moduleAliveTime_[modID] = currentBaseTime;
+                            i += 8; continue;
+                        }
                     }
-
                     currentBaseTime = newTime;
                     lastT = currentBaseTime;
                     moduleAliveTime_[modID] = currentBaseTime;
                     i += 8;
+
                 } else if (h == 0x6a) {
                     unsigned char* p = &buf[i+1];
                     unsigned int tof = (p[0] << 16) | (p[1] << 8) | p[2];
@@ -385,7 +391,11 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                 } else { i += 8; }
             } else { i++; }
         }
-        offset += i;
+        
+        // ★★★ 修正箇所: 解析した 'i' ではなく、読み込んだ 'readCount' 分を進める ★★★
+        // これにより、8バイト未満の端数があってもファイルポインタが進行し、EOFに到達できる
+        offset += readCount; 
+        
     } else { offset = fileSize; }
 
     baseTimeMap_[modID] = currentBaseTime;
@@ -393,24 +403,29 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     return {lastT, (offset >= fileSize)}; 
 }
 
+
 void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues) {
     const size_t PER_MOD_CAP = 1000000; 
     std::map<int, std::deque<Event>> moduleBuffers;
     std::map<int, unsigned long long> moduleLastTime;
     auto lastUIDraw = std::chrono::system_clock::now();
 
+    // 初期化
     for (auto const& [mod, q] : fileQueues) {
         moduleLastTime[mod] = 0;
         currentFileOffsets_[mod] = 0;
         hasSeenTimeHeaderMap_[mod] = false;
         baseTimeMap_[mod] = 0;
     }
+    deadTimeRanges_.clear();
 
     isAnalysisStarted_ = false;
     globalStartTimestamp_ = 0;
     totalEffectiveTimeNs_ = 0; 
     analysisStartTime_ = std::chrono::system_clock::now();
     
+    unsigned long long lastSafeTime = 0;
+
     printSearchStatus();
 
     while (true) {
@@ -419,7 +434,6 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         bool anyBufLeft = false;
         for (auto const& [m, b] : moduleBuffers) if (!b.empty()) anyBufLeft = true;
         
-        // 全て読み終わり、かつ処理も終われば終了
         if (!anyFileLeft && !anyBufLeft) break;
 
         // --- 1. 読み込み ---
@@ -434,23 +448,21 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         }
 
         if (laggingMod != -1) {
-            std::vector<Event> temp;
-            auto res = readEventsFromFile(fileQueues[laggingMod].front(), laggingMod, temp, currentFileOffsets_[laggingMod]);
-            
-            // 書き込み制限 (メモリ保護)
             if (moduleBuffers[laggingMod].size() < PER_MOD_CAP) {
+                std::vector<Event> temp;
+                auto res = readEventsFromFile(fileQueues[laggingMod].front(), laggingMod, temp, currentFileOffsets_[laggingMod]);
+                
                 for (auto& ev : temp) moduleBuffers[laggingMod].push_back(std::move(ev));
-            }
-            
-            // 時刻更新
-            if (res.first > moduleLastTime[laggingMod]) {
-                moduleLastTime[laggingMod] = res.first;
-            }
+                
+                if (res.first > moduleLastTime[laggingMod]) {
+                    moduleLastTime[laggingMod] = res.first;
+                }
 
-            // EOF処理
-            if (res.second) {
-                fileQueues[laggingMod].pop_front();
-                currentFileOffsets_[laggingMod] = 0;
+                if (res.second) {
+                    printLog("[FINISHED] Mod " + std::to_string(laggingMod) + ": " + fileQueues[laggingMod].front());
+                    fileQueues[laggingMod].pop_front();
+                    currentFileOffsets_[laggingMod] = 0;
+                }
             }
         }
 
@@ -464,38 +476,37 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
             if (allHasT0 && maxBaseT0 > 0) {
                 globalStartTimestamp_ = maxBaseT0;
+                lastSafeTime = maxBaseT0;
                 isAnalysisStarted_ = true;
                 printLog("Synchronization Established at T0 = " + std::to_string(globalStartTimestamp_));
             }
         }
 
-        // --- 3. 時間更新 & 終了判定 (SafeTime基準) ---
-        unsigned long long safeTime = std::numeric_limits<unsigned long long>::max();
+        // --- 3. 時間更新 ---
         if (isAnalysisStarted_) {
-            // 全モジュールの現在時刻の「最小値」＝ここまでなら全員同期して生きていたと言える時刻
-            for (auto const& [m, t] : moduleLastTime) {
-                safeTime = std::min(safeTime, t);
-            }
+            unsigned long long currentSafe = getSafeTime(moduleLastTime);
             
-            if (safeTime > globalStartTimestamp_) {
-                currentEventTime_ns_ = safeTime;
-                totalEffectiveTimeNs_ = safeTime - globalStartTimestamp_;
+            // 実効時間の蓄積 (10秒以上のジャンプは除外)
+            if (currentSafe > lastSafeTime) {
+                unsigned long long diff = currentSafe - lastSafeTime;
+                if (diff < 10000000000ULL) { 
+                    totalEffectiveTimeNs_ += diff;
+                }
+                lastSafeTime = currentSafe;
+                currentEventTime_ns_ = currentSafe;
             }
 
-            // ★終了判定: 同期時刻が指定時間を超えたら即終了
             if (analysisDuration_ns_ > 0 && totalEffectiveTimeNs_ >= analysisDuration_ns_) {
-                printLog("Limit Reached (SafeTime). Finishing Analysis.");
+                printLog("Limit Reached (Effective Time). Finishing.");
                 break;
             }
         }
 
-        // --- 4. 解析 (SafeTime境界での抽出) ---
+        // --- 4. 解析 (Global Veto) ---
         if (isAnalysisStarted_) {
-            // ★重要修正: ここにあった「safeTime = max」の上書き削除
-            // これにより、バッファに残った未来のデータを一気飲みすることなく
-            // 指定時間(safeTime)までの処理を遵守します。
-
+            unsigned long long safeTime = getSafeTime(moduleLastTime);
             std::vector<Event> mergeChunk;
+            
             for (auto& [m, buf] : moduleBuffers) {
                 while (!buf.empty() && buf.front().eventTime_ns <= safeTime) {
                     Event ev = std::move(buf.front());
@@ -505,26 +516,105 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
 
             if (!mergeChunk.empty()) {
-                std::sort(mergeChunk.begin(), mergeChunk.end(), [](const Event& a, const Event& b){
-                    return a.eventTime_ns < b.eventTime_ns;
-                });
-                processChunk(mergeChunk);
+                auto it = std::remove_if(mergeChunk.begin(), mergeChunk.end(), 
+                    [&](const Event& e) {
+                        for (const auto& range : deadTimeRanges_) {
+                            if (e.eventTime_ns >= range.first && e.eventTime_ns <= range.second) return true; 
+                        }
+                        return false; 
+                    });
+                mergeChunk.erase(it, mergeChunk.end());
+
+                if (!mergeChunk.empty()) {
+                    std::sort(mergeChunk.begin(), mergeChunk.end(), [](const Event& a, const Event& b){
+                        return a.eventTime_ns < b.eventTime_ns;
+                    });
+                    processChunk(mergeChunk);
+                }
             }
         }
 
-        // UI更新
+        // --- UI更新 (Linux風バッファモニター) ---
         auto nowLoop = std::chrono::system_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(nowLoop - lastUIDraw).count() > 500) {
             printSearchStatus();
+            
+            std::stringstream ss;
+            const int BAR_WIDTH = 40; 
+            const std::string BLOCK_FULL = "█";
+            const std::string BLOCK_EMPTY = "░";
+
+            ss << "\n"; 
+            for(auto const& [m, b] : moduleBuffers) {
+                double usage = (double)b.size() / PER_MOD_CAP;
+                if (usage > 1.0) usage = 1.0;
+                
+                int filled = (int)(usage * BAR_WIDTH);
+                
+                ss << " Mod " << m << " ";
+                for (int i = 0; i < BAR_WIDTH; ++i) {
+                    if (i < filled) ss << BLOCK_FULL;
+                    else ss << BLOCK_EMPTY;
+                }
+                ss << " " << std::fixed << std::setw(5) << std::setprecision(1) << (usage * 100.0) 
+                   << "% (" << b.size() << ")\n";
+            }
+            // ログファイルへの記録は printLog、画面への表示は見やすさ重視でそのまま出力
+            // ここでは printLog を使いつつ、直前のログがBufferなら上書きするような制御は難しいため
+            // そのまま流します（デバッグ中は流れ続けてOK）
+            printLog(ss.str()); 
+            
             lastUIDraw = nowLoop;
         }
     }
     
-    printSearchStatus();
+    // --- 最終結果の集計 ---
     printLog("Analysis Completed.");
+    
+    // デッドタイムの整理
+    std::sort(deadTimeRanges_.begin(), deadTimeRanges_.end());
+    std::vector<std::pair<unsigned long long, unsigned long long>> mergedDeadTime;
+    for (const auto& range : deadTimeRanges_) {
+        if (mergedDeadTime.empty() || range.first > mergedDeadTime.back().second) {
+            mergedDeadTime.push_back(range);
+        } else {
+            mergedDeadTime.back().second = std::max(mergedDeadTime.back().second, range.second);
+        }
+    }
+
+    unsigned long long totalDeadTimeNs = 0;
+    for (const auto& range : mergedDeadTime) {
+        if (range.second > range.first) totalDeadTimeNs += (range.second - range.first);
+    }
+    
+    unsigned long long finalTime = getSafeTime(moduleLastTime);
+    unsigned long long totalSpanNs = (finalTime > globalStartTimestamp_) ? (finalTime - globalStartTimestamp_) : 0;
+    
+    // ★重要: 正味のライブタイム計算
+    unsigned long long correctedLiveTimeNs = (totalSpanNs > totalDeadTimeNs) ? (totalSpanNs - totalDeadTimeNs) : 0;
+
+    // ★重要: クラスメンバ変数を上書き更新（後続のログ出力などで正しい値が使われるようにする）
+    totalEffectiveTimeNs_ = correctedLiveTimeNs;
+    totalEffectiveTimeSec_ = (double)correctedLiveTimeNs / 1e9;
+
+    double spanSec = (double)totalSpanNs / 1e9;
+    double deadSec = (double)totalDeadTimeNs / 1e9;
+    double liveSec = (double)correctedLiveTimeNs / 1e9;
+    double efficiency = (spanSec > 0) ? (liveSec / spanSec) * 100.0 : 0.0;
+
+    // --- 整形された結果出力 (std::cout を使用して [INFO] を回避) ---
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << " [RESULT] Dead-Time Corrected Analysis" << std::endl;
+    std::cout << "========================================================" << std::endl;
+    std::cout << "  Total Data Span : " << std::fixed << std::setprecision(2) << spanSec << " sec" << std::endl;
+    std::cout << "  Total Dead Time : " << deadSec << " sec (" << mergedDeadTime.size() << " gap(s) removed)" << std::endl;
+    std::cout << " --------------------------------------------------------" << std::endl;
+    std::cout << "  Net Live Time   : " << liveSec << " sec" << std::endl;
+    std::cout << "  Effective Eff.  : " << efficiency << " %" << std::endl;
+    std::cout << "========================================================\n" << std::endl;
+    
+    printSearchStatus();
 }
-
-
 
 bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
     if (sortedEvents.empty()) return true;
