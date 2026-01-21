@@ -765,27 +765,25 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
 
     const size_t BUFFER_SIZE = 64 * 1024 * 1024; 
     std::vector<char> buffer(BUFFER_SIZE);
-    size_t leftover = 0;
     unsigned long long lastT = currentBaseTime; 
 
-    // ★追加: T0アンカー処理用の記録コンテナ
     std::vector<size_t> t0_indices;           
     std::vector<size_t> t0_event_snapshots;   
 
-    ifs.read(buffer.data() + leftover, BUFFER_SIZE - leftover);
+    ifs.read(buffer.data(), BUFFER_SIZE);
     size_t readCount = ifs.gcount();
     
     if (readCount > 0) {
-        size_t totalBytesInBuffer = leftover + readCount;
         processedDataSize_ += readCount; 
         size_t i = 0;
         unsigned char* buf = reinterpret_cast<unsigned char*>(buffer.data());
 
-        while (i + 8 <= totalBytesInBuffer) {
+        while (i + 8 <= readCount) {
             unsigned char h = buf[i];
             bool syncOK = false;
 
-            if (i + 80 > totalBytesInBuffer) {
+            // 1. 物理同期：10パケット連動検証
+            if (i + 80 > readCount) {
                 if (h == 0x69 || h == 0x6a) syncOK = true;
             } else {
                 syncOK = true;
@@ -795,64 +793,74 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                 }
             }
 
+            // 2. 探索モード
             if (!hasSeenHeader) {
-                if (syncOK && h == 0x69) {
-                    unsigned char* p = &buf[i+1];
-                    unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-                    unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
-                    unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
-                    unsigned long long foundTime = s * 1000000000ULL + ss * 1000000ULL + t;
+                if (syncOK) {
+                    if (h == 0x69) {
+                        unsigned char* p = &buf[i+1];
+                        unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                        unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
+                        unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
+                        unsigned long long foundTime = s * 1000000000ULL + ss * 1000000ULL + t;
 
-                    if (foundTime > baseTimeMap_[modID]) {
-                        currentBaseTime = foundTime;
-                        hasSeenHeader = true; 
-                        lastT = currentBaseTime;
-                        moduleAliveTime_[modID] = currentBaseTime;
-                        if (firstT0Time_ == 0) firstT0Time_ = s;
-                        
-                        // ★記録: 最初のT0
                         t0_indices.push_back(i);
                         t0_event_snapshots.push_back(rawEvents.size());
+
+                        if (foundTime > baseTimeMap_[modID]) {
+                            long long diff = (long long)foundTime - (long long)currentBaseTime;
+                            
+                            // ★跳躍検知：実装済みの printFileTail を使用
+                            if (currentBaseTime != 0 && std::abs(diff) >= 1000000000LL) {
+                                printLog("[ANOMALY DETECTED] Diff: " + std::to_string(diff) + " ns. Dumping binary...");
+                                printFileTail(fileName, offset + i); 
+                                // 先生の指示通り「不自然でも続き」として受け入れて同期を確立する
+                            }
+                            
+                            if (currentBaseTime != 0) deadTimeRanges_.push_back({currentBaseTime, foundTime});
+                            currentBaseTime = foundTime;
+                            hasSeenHeader = true; 
+                            lastT = currentBaseTime;
+                            moduleAliveTime_[modID] = currentBaseTime;
+                            if (firstT0Time_ == 0) firstT0Time_ = s;
+                        }
                     }
+                    i += 8;
+                } else {
+                    i++;
                 }
-                i += (syncOK ? 8 : 1);
                 continue; 
             }
 
+            // 3. 通常解析モード
             if (syncOK) {
-                if (h == 0x69) { // T0 Header
+                if (h == 0x69) { 
                     unsigned char* p = &buf[i+1];
                     unsigned long long s = (static_cast<unsigned long long>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
                     unsigned long long ss = (static_cast<unsigned long long>(p[4]) << 2) | ((p[5] & 0xC0) >> 6);
                     unsigned long long t = ((p[5] & 0x3F) << 2) | ((p[6] & 0xC0) >> 6);
                     unsigned long long newTime = s * 1000000000ULL + ss * 1000000ULL + t;
 
-                    long long diff = (long long)(newTime - currentBaseTime);
-                    if (std::abs(diff) > 1000000000LL) {
-                        if (diff > 0) { 
-                            deadTimeRanges_.push_back({currentBaseTime, newTime});
-                            currentBaseTime = newTime;
-                        }
-                    } else {
-                        currentBaseTime = newTime;
-                    }
-                    lastT = currentBaseTime;
-                    moduleAliveTime_[modID] = currentBaseTime;
-                    
-                    // ★記録: T0発見
                     t0_indices.push_back(i);
                     t0_event_snapshots.push_back(rawEvents.size());
 
+                    long long diff = (long long)newTime - (long long)currentBaseTime;
+                    
+                    if (std::abs(diff) > 1000000000LL) {
+                        printLog("[ANOMALY IN RUN] Diff: " + std::to_string(diff) + " ns. Dumping...");
+                        printFileTail(fileName, offset + i);
+                        // 同期は維持したまま時刻を更新
+                    }
+                    currentBaseTime = newTime;
+                    lastT = currentBaseTime;
+                    moduleAliveTime_[modID] = currentBaseTime;
                     i += 8;
-
-                } else if (h == 0x6a) { // Event Data
+                } else if (h == 0x6a) { 
                     unsigned char* p = &buf[i+1];
                     unsigned int tof = (p[0] << 16) | (p[1] << 8) | p[2];
                     unsigned int pw  = (p[3] << 12) | (p[4] << 4) | ((p[5] & 0xF0) >> 4);
                     int det = ((p[5] & 0x0F) << 8) | p[6];
                     int mod = (det >> 8) & 0xF;
                     int sys = det & 0xFF;
-                    
                     if (mod < MAX_MODULES && sys < MAX_SYS_CH && ch_LUT[mod][sys].isValid) {
                         if (tof >= pw) { 
                             unsigned long long eventT = currentBaseTime + (unsigned long long)(tof - pw);
@@ -863,29 +871,22 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                     }
                     i += 8;
                 } else { i += 8; }
-            } else { i++; }
+            } else { 
+                hasSeenHeader = false;
+                i++; 
+            }
         }
         
-        // ★変更: T0アンカー方式によるオフセット更新ロジック
+        // T0アンカー方式
         bool willBeEOF = (offset + readCount >= (unsigned long long)fileSize);
-        
-
         if (!willBeEOF && t0_indices.size() >= 2) {
-            // Case A: ファイル途中なら、最後のT0 (N-1) まで進めて、データもそこまでで切る
             size_t lastT0Pos = t0_indices.back();
             size_t snapshotSize = t0_event_snapshots.back();
-
             offset += lastT0Pos;
-
-            // 最後のT0以降のイベントは破棄 (次回読み直し)
-            if (rawEvents.size() > snapshotSize) {
-                rawEvents.resize(snapshotSize);
-            }
+            if (rawEvents.size() > snapshotSize) rawEvents.resize(snapshotSize);
         } else {
-            // Case B: ファイル末端 または T0不足なら全部進める
             offset += readCount;
         }
-        
     } else { offset = fileSize; }
 
     baseTimeMap_[modID] = currentBaseTime;
