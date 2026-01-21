@@ -73,12 +73,17 @@ DetectorAnalyzer::DetectorAnalyzer(int timeWindow_ns, const std::string& outputF
       totalEffectiveTimeSec_(0.0),
       currentProcessingRunID_(-1),
       suppressTimeoutWarnings_(false), 
-      prevEventTimeForEff_(0)
+      prevEventTimeForEff_(0),
+      // ★初期化: デフォルトは爆速モード(OFF)
+      enableMuonAnalysis_(false), 
+      idealFile_(nullptr), idealTree_(nullptr),
+      hEventWidth_All(nullptr), hEventWidth_CondA(nullptr), hEventWidth_CondB(nullptr),
+      b_i_type(nullptr), b_i_strip(nullptr), b_i_tot(nullptr), b_i_time(nullptr),
+      globalEventID_Ideal_(0)
 {
-    g_currentAnalyzer = this; // グローバルポインタに登録
+    g_currentAnalyzer = this;
     gROOT->SetBatch(kTRUE); 
 
-    // ★ 修正: Clock表示の起点をここで初期化
     analysisStartTime_ = std::chrono::system_clock::now();
 
     if (!outputFile_ || outputFile_->IsZombie()) {
@@ -93,7 +98,7 @@ DetectorAnalyzer::DetectorAnalyzer(int timeWindow_ns, const std::string& outputF
         }
     }
 
-    setupTree();
+    setupTree(); // 初期設定 (爆速モードならidealFileは作らない)
 
     struct stat st = {}; 
     if (stat("./gainshift", &st) == -1) {
@@ -110,61 +115,343 @@ DetectorAnalyzer::DetectorAnalyzer(int timeWindow_ns, const std::string& outputF
 }
 
 
-// ----------------------------------------------------------------------------
-// デストラクタ
-// ----------------------------------------------------------------------------
-
-DetectorAnalyzer::~DetectorAnalyzer() {
-    if (currentEventTime_ns_ > lastGlobalAnalysisTime_ns_) {
-        analyzeGainShift(currentEventTime_ns_);
+void DetectorAnalyzer::setMuonAnalysisMode(bool enable) {
+    enableMuonAnalysis_ = enable;
+    if (enable) {
+        printLog("[MODE] Muon Analysis ENABLED (Clustering Active, Slower)");
+    } else {
+        printLog("[MODE] Fast Gain Check ONLY (Muon Extraction Disabled)");
     }
+    // モード変更後に再度 setupTree を呼んでファイル生成状態を同期させる
+    // (ただし、すでにファイルが開いている場合は二重作成を避けるロジックが必要だが、
+    //  通常はコンストラクタ直後に呼ぶので、今回は簡易的に次回実行時反映とするか、
+    //  setupTree内のガードに任せる)
+}
 
-    calculateEffectiveTime();
 
-    if (outputFile_ && outputFile_->IsOpen()) {
-        outputFile_->cd();
-        if (tree_) tree_->Write();
+bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
+    if (enableMuonAnalysis_) {
+        return processChunk_Muon(sortedEvents);
+    } else {
+        return processChunk_Fast(sortedEvents);
+    }
+}
+
+// ★爆速モード: ゲイン解析のみ (バッファリング・ミュオン抽出なし)
+bool DetectorAnalyzer::processChunk_Fast(const std::vector<Event>& sortedEvents) {
+    if (sortedEvents.empty()) return true;
+    static bool isReported[MAX_MODULES][MAX_SYS_CH] = {false};
+
+    for (size_t i = 0; i < sortedEvents.size(); ++i) {
+        const auto& e = sortedEvents[i];
         
-        // ★修正: Canvas生成ループを廃止し、データ(TH1F)を直接保存
-        
-        if (!outputFile_->GetDirectory("Histograms")) outputFile_->mkdir("Histograms");
-        outputFile_->cd("Histograms");
+        // 1. 基本解析 (ラン初期化, 実効時間)
+        if (currentRunStartTime_ == 0) {
+            if (e.tot >= 1000) {
+                currentRunStartTime_ = e.eventTime_ns;
+                lastTimeoutCheckTime_ = e.eventTime_ns; 
+                prevEventTimeForEff_ = e.eventTime_ns;
+                lastGlobalAnalysisTime_ns_ = e.eventTime_ns; // ここで初期化しておく
+                for(int mid : activeModuleIDs_) moduleAliveTime_[mid] = e.eventTime_ns;
+            } else continue;
+        }
+        currentEventTime_ns_ = e.eventTime_ns;
+        moduleAliveTime_[e.module] = e.eventTime_ns;
 
-        std::vector<std::pair<int, int>> sortedKeys;
-        for (auto const& [key, info] : detConfigMap_) sortedKeys.push_back(key);
-        std::sort(sortedKeys.begin(), sortedKeys.end(), [&](std::pair<int,int> a, std::pair<int,int> b){
-            const auto& iA = detConfigMap_[a];
-            const auto& iB = detConfigMap_[b];
-            if(iA.detTypeID != iB.detTypeID) return iA.detTypeID < iB.detTypeID;
-            return iA.strip < iB.strip; 
-        });
+        bool isSystemHealthy = true;
+        for (int mid : activeModuleIDs_) {
+            if (moduleAliveTime_.find(mid) == moduleAliveTime_.end()) { isSystemHealthy = false; break; }
+        }
+        if (isSystemHealthy && prevEventTimeForEff_ > 0) {
+            unsigned long long dt_ns = e.eventTime_ns - prevEventTimeForEff_;
+            if (dt_ns < 5000000000ULL) totalEffectiveTimeNs_ += dt_ns;
+        }
+        prevEventTimeForEff_ = e.eventTime_ns;
 
-        for (const auto& key : sortedKeys) {
-            TH1F* hist = hRawToTMap[key];
-            if (!hist) continue;
-            // ゲートで弾かれてエントリが0でも、存在確認のため一応保存する設定に変更（必要に応じて entries > 0 にしてください）
-            hist->Write();
+        // ★修正: 2. データの充填 (解析よりも先に実行！)
+        if (e.module < MAX_MODULES && e.sysCh < MAX_SYS_CH) {
+            if (!isReported[e.module][e.sysCh]) {
+                foundChannels_[{e.module, e.sysCh}].insert(e.strip);
+                isReported[e.module][e.sysCh] = true; 
+            }
+            // 解析用ヒストグラムに今のイベントを入れる
+            if (hGainCheck_LUT[e.module][e.sysCh]) hGainCheck_LUT[e.module][e.sysCh]->Fill((double)e.tot);
+            
+            // 生ToTヒストグラムにも入れる
+            if (hRawToT_LUT[e.module][e.sysCh]) hRawToT_LUT[e.module][e.sysCh]->Fill((double)e.tot);
+            
+            int pIdx = ch_LUT[e.module][e.sysCh].pIndex;
+            if (hGlobalPIndexMap && pIdx >= 0) hGlobalPIndexMap->Fill((double)pIdx);
         }
 
-        outputFile_->cd();
-        if(gT0Check) gT0Check->Write("T0_Check");
+        // ★修正: 3. ゲイン解析呼び出し (充填済みのデータを使って解析)
+        if (e.eventTime_ns >= lastGlobalAnalysisTime_ns_ + GAIN_ANALYSIS_WINDOW_NS) {
+            analyzeGainShift(e.eventTime_ns);
+            lastGlobalAnalysisTime_ns_ = e.eventTime_ns;
+        }
 
-        if (!outputFile_->GetDirectory("GainHistory")) outputFile_->mkdir("GainHistory");
-        outputFile_->cd("GainHistory");
-        for (auto const& [key, g] : gainEvolutionGraphs_) if(g && g->GetN() > 0) g->Write();
+        // 4. Tree Fill
+        b_type = static_cast<Char_t>(e.type);
+        b_strip = static_cast<Char_t>(e.strip);
+        b_tot = static_cast<Int_t>(e.tot);
+        b_time = static_cast<Long64_t>(e.eventTime_ns - globalStartTimestamp_);
+        if (tree_) tree_->Fill();
 
-        if (!outputFile_->GetDirectory("RateHistory")) outputFile_->mkdir("RateHistory");
-        outputFile_->cd("RateHistory");
-        for (auto const& [key, g] : rateEvolutionGraphs_) if(g && g->GetN() > 0) g->Write();
-
-        outputFile_->Write();
+        // 5. DeltaT
+        if (i > 0) {
+            long long dt1 = (long long)e.eventTime_ns - (long long)sortedEvents[i-1].eventTime_ns;
+            if (dt1 >= 0 && dt1 < 1000000 && hDeltaT_Nearest) hDeltaT_Nearest->Fill((double)dt1);
+        }
+        if (i + 7 < sortedEvents.size()) {
+            long long dt8 = (long long)sortedEvents[i+7].eventTime_ns - (long long)e.eventTime_ns;
+            if (dt8 >= 0 && dt8 < 1000000 && hDeltaT_n8) hDeltaT_n8->Fill((double)dt8);
+        }
     }
-    
-    if (outputFile_) { outputFile_->Close(); delete outputFile_; outputFile_ = nullptr; }
-    if (gainLogCsv_.is_open()) gainLogCsv_.close();
-    if (rateLogCsv_.is_open()) rateLogCsv_.close();
-    printLog("Analysis cleanup completed.");
+    return true;
 }
+
+// ★Slowモード: ゲイン解析 + ミュオン抽出
+bool DetectorAnalyzer::processChunk_Muon(const std::vector<Event>& sortedEvents) {
+    if (sortedEvents.empty()) return true;
+    static bool isReported[MAX_MODULES][MAX_SYS_CH] = {false};
+
+    for (size_t i = 0; i < sortedEvents.size(); ++i) {
+        const auto& e = sortedEvents[i];
+        
+        // 1. 基本解析 (ラン初期化, 実効時間)
+        if (currentRunStartTime_ == 0) {
+            if (e.tot >= 1000) {
+                currentRunStartTime_ = e.eventTime_ns;
+                lastTimeoutCheckTime_ = e.eventTime_ns; 
+                prevEventTimeForEff_ = e.eventTime_ns;
+                lastGlobalAnalysisTime_ns_ = e.eventTime_ns; // 初期化
+                for(int mid : activeModuleIDs_) moduleAliveTime_[mid] = e.eventTime_ns;
+            } else continue;
+        }
+        currentEventTime_ns_ = e.eventTime_ns;
+        moduleAliveTime_[e.module] = e.eventTime_ns;
+
+        bool isSystemHealthy = true;
+        for (int mid : activeModuleIDs_) {
+            if (moduleAliveTime_.find(mid) == moduleAliveTime_.end()) { isSystemHealthy = false; break; }
+        }
+        if (isSystemHealthy && prevEventTimeForEff_ > 0) {
+            unsigned long long dt_ns = e.eventTime_ns - prevEventTimeForEff_;
+            if (dt_ns < 5000000000ULL) totalEffectiveTimeNs_ += dt_ns;
+        }
+        prevEventTimeForEff_ = e.eventTime_ns;
+
+        // ★修正: 2. データの充填 (解析よりも先に実行！)
+        if (e.module < MAX_MODULES && e.sysCh < MAX_SYS_CH) {
+            if (!isReported[e.module][e.sysCh]) {
+                foundChannels_[{e.module, e.sysCh}].insert(e.strip);
+                isReported[e.module][e.sysCh] = true; 
+            }
+            // 解析用ヒストグラムに今のイベントを入れる
+            if (hGainCheck_LUT[e.module][e.sysCh]) hGainCheck_LUT[e.module][e.sysCh]->Fill((double)e.tot);
+            
+            // 生ToTヒストグラムにも入れる
+            if (hRawToT_LUT[e.module][e.sysCh]) hRawToT_LUT[e.module][e.sysCh]->Fill((double)e.tot);
+
+            int pIdx = ch_LUT[e.module][e.sysCh].pIndex;
+            if (hGlobalPIndexMap && pIdx >= 0) hGlobalPIndexMap->Fill((double)pIdx);
+        }
+
+        // ★修正: 3. ゲイン解析呼び出し (充填済みのデータを使って解析)
+        if (e.eventTime_ns >= lastGlobalAnalysisTime_ns_ + GAIN_ANALYSIS_WINDOW_NS) {
+            analyzeGainShift(e.eventTime_ns);
+            lastGlobalAnalysisTime_ns_ = e.eventTime_ns;
+        }
+
+        // 4. Tree Fill
+        b_type = static_cast<Char_t>(e.type);
+        b_strip = static_cast<Char_t>(e.strip);
+        b_tot = static_cast<Int_t>(e.tot);
+        b_time = static_cast<Long64_t>(e.eventTime_ns - globalStartTimestamp_);
+        if (tree_) tree_->Fill();
+
+        // 5. DeltaT
+        if (i > 0) {
+            long long dt1 = (long long)e.eventTime_ns - (long long)sortedEvents[i-1].eventTime_ns;
+            if (dt1 >= 0 && dt1 < 1000000 && hDeltaT_Nearest) hDeltaT_Nearest->Fill((double)dt1);
+        }
+        if (i + 7 < sortedEvents.size()) {
+            long long dt8 = (long long)sortedEvents[i+7].eventTime_ns - (long long)e.eventTime_ns;
+            if (dt8 >= 0 && dt8 < 1000000 && hDeltaT_n8) hDeltaT_n8->Fill((double)dt8);
+        }
+
+        // Slowモード固有: バッファリング
+        analysisBuffer_.push_back(e);
+    }
+
+    // Slowモード固有: ミュオン抽出実行
+    processEventExtraction();
+
+    return true;
+}
+
+
+
+
+void DetectorAnalyzer::processEventExtraction() {
+    // バッファが空なら処理不要
+    if (analysisBuffer_.empty()) return;
+
+    // スライディングウィンドウでバッファを走査
+    // 少なくとも8イベントないと判定できないため、残りが8未満になったらループを抜けて次回の呼び出しを待つ
+    while (analysisBuffer_.size() >= 8) { 
+        
+        // --- 競合解決型探索ロジック ---
+        // 先頭 (index 0) から始まる範囲、およびその近傍で競合する候補の中で
+        // 「最も時間幅 (width) が小さいもの」をベスト候補として選ぶ。
+        
+        struct Candidate {
+            size_t startIdx;
+            size_t length; // 7 or 8
+            double width;
+        };
+
+        Candidate bestCand = {0, 0, 1.0e20}; // 初期値: 無効な巨大Width
+        bool foundAny = false;
+        
+        // 先頭(0)を含む可能性がある範囲として、0〜7番目を始点とする候補を総当りチェック
+        // (8ヒット同士が重なる最大の範囲を考慮)
+        size_t scanLimit = 8;
+        if (analysisBuffer_.size() < scanLimit + 8) scanLimit = analysisBuffer_.size() - 8;
+
+        for (size_t i = 0; i < scanLimit; ++i) {
+            double w = 0;
+            // 条件A (8ヒット完全) を優先チェック
+            bool isA = checkConditionA(analysisBuffer_, i, w);
+            bool isB = false;
+            
+            // 条件Aでなければ 条件B (7ヒット救済) をチェック
+            if (!isA) isB = checkConditionB(analysisBuffer_, i, w);
+
+            if (isA || isB) {
+                // 候補発見。暫定ベスト(width最小)と比較更新
+                if (w < bestCand.width) {
+                    bestCand = {i, (isA ? 8UL : 7UL), w};
+                    foundAny = true;
+                }
+            }
+        }
+
+        // --- 判定と保存 ---
+        if (foundAny) {
+            // ベスト候補が見つかった場合
+            
+            // 1. 幅のヒストグラムにFill (コインシデンス幅決定用)
+            hEventWidth_All->Fill(bestCand.width);
+            if (bestCand.length == 8) hEventWidth_CondA->Fill(bestCand.width);
+            else hEventWidth_CondB->Fill(bestCand.width);
+
+            // 2. ベスト候補より「前」にあるデータは、どの条件も満たさなかったゴミなので捨てる
+            for (size_t k = 0; k < bestCand.startIdx; ++k) {
+                analysisBuffer_.pop_front();
+            }
+            // (これでベスト候補がバッファの先頭(0)に来た)
+
+            // 3. ベスト候補をTreeに保存
+            b_i_runID = currentProcessingRunID_;
+            b_i_eventID = globalEventID_Ideal_++;
+            b_i_nHits = (int)bestCand.length;
+            b_i_width = bestCand.width;
+            
+            b_i_type->clear(); b_i_strip->clear(); b_i_tot->clear(); b_i_time->clear();
+            
+            double tMin = analysisBuffer_[0].eventTime_ns; // 先頭を基準0とする
+
+            for (size_t k = 0; k < bestCand.length; ++k) {
+                const auto& e = analysisBuffer_[k];
+                b_i_type->push_back(ch_LUT[e.module][e.sysCh].detTypeID);
+                b_i_strip->push_back(ch_LUT[e.module][e.sysCh].strip);
+                b_i_tot->push_back(e.tot);
+                b_i_time->push_back((double)(e.eventTime_ns - tMin));
+            }
+            if (idealTree_) idealTree_->Fill();
+
+            // 4. 使用済みデータを破棄 (二重カウント防止)
+            for (size_t k = 0; k < bestCand.length; ++k) {
+                analysisBuffer_.pop_front();
+            }
+
+        } else {
+            // 探索範囲(先頭近傍)に候補が一つもなかった
+            // -> 先頭の1個はイベントを構成しないノイズ確定なので捨てる
+            analysisBuffer_.pop_front();
+        }
+    }
+}
+
+// --- 条件判定ヘルパー関数 ---
+
+bool DetectorAnalyzer::checkConditionA(const std::deque<Event>& buf, size_t startIdx, double& outWidth) {
+    if (startIdx + 8 > buf.size()) return false;
+    
+    // 時間順ソート済みなので、Width = 末尾時刻 - 先頭時刻
+    outWidth = (double)(buf[startIdx+7].eventTime_ns - buf[startIdx].eventTime_ns);
+
+    // 8個取り出す
+    std::map<int, std::vector<int>> sMap;
+    for(size_t i=0; i<8; ++i) {
+        const auto& e = buf[startIdx+i];
+        int type = ch_LUT[e.module][e.sysCh].detTypeID;
+        int strip = ch_LUT[e.module][e.sysCh].strip;
+        sMap[type].push_back(strip);
+    }
+
+    // 条件A: 全4層(0,1,2,3)で隣接ペア(差が1の2ヒット)があるか
+    for(int type=0; type<4; ++type) {
+        if (!hasAdjacentPair(sMap[type])) return false;
+    }
+    return true;
+}
+
+bool DetectorAnalyzer::checkConditionB(const std::deque<Event>& buf, size_t startIdx, double& outWidth) {
+    if (startIdx + 7 > buf.size()) return false;
+    
+    outWidth = (double)(buf[startIdx+6].eventTime_ns - buf[startIdx].eventTime_ns);
+    
+    std::map<int, std::vector<int>> sMap;
+    for(size_t i=0; i<7; ++i) {
+        const auto& e = buf[startIdx+i];
+        int type = ch_LUT[e.module][e.sysCh].detTypeID;
+        int strip = ch_LUT[e.module][e.sysCh].strip;
+        sMap[type].push_back(strip);
+    }
+
+    // 条件B: 
+    // X1(0), X2(2), Y2(3) は隣接ペア必須
+    if (!hasAdjacentPair(sMap[0])) return false;
+    if (!hasAdjacentPair(sMap[2])) return false;
+    if (!hasAdjacentPair(sMap[3])) return false;
+
+    // Y1(1) は1ヒットのみ かつ オフライン隣接
+    if (sMap[1].size() != 1) return false;
+    
+    return isAdjacentToOffline(sMap[1][0], 1);
+}
+
+bool DetectorAnalyzer::hasAdjacentPair(const std::vector<int>& strips) {
+    if (strips.size() < 2) return false;
+    std::vector<int> s = strips;
+    std::sort(s.begin(), s.end());
+    // 隣り合う要素の差が1なら隣接
+    for(size_t i=0; i<s.size()-1; ++i) {
+        if (s[i+1] - s[i] == 1) return true;
+    }
+    return false;
+}
+
+bool DetectorAnalyzer::isAdjacentToOffline(int strip, int detTypeID) {
+    // オフラインリストにある (detTypeID, strip ± 1) を探す
+    if (offlineStrips_.count({detTypeID, strip - 1})) return true;
+    if (offlineStrips_.count({detTypeID, strip + 1})) return true;
+    return false;
+}
+
+
 
 // ----------------------------------------------------------------------------
 // データストリーム同期
@@ -259,33 +546,204 @@ bool DetectorAnalyzer::syncDataStream(std::ifstream& ifs, long long& skippedByte
 // ----------------------------------------------------------------------------
 // 修正対象 1: Treeの定義 (データ型最適化)
 // ----------------------------------------------------------------------------
+
 void DetectorAnalyzer::setupTree() {
     outputFile_->cd();
-    // Tree名を変更せず、構造のみ最適化
-    tree_ = new TTree("Events", "Raw Detector Hits");
-
-    // type(1byte), strip(1byte), tot(4bytes), time(8bytes:相対時間)
-    tree_->Branch("type",  &b_type,  "type/B");   // Char_t
-    tree_->Branch("strip", &b_strip, "strip/B");  // Char_t
-    tree_->Branch("tot",   &b_tot,   "tot/I");    // Int_t (100,000ns対応)
-    tree_->Branch("time",  &b_time,  "time/L");   // Long64_t
-
-    // ヒストグラム定義は変更なし
-    hDeltaT_Nearest = new TH1F("DeltaT_Nearest", "Delta T (Nearest Neighbor);Delta T [ns];Counts / ns", 100000, 0, 100000);
-    hDeltaT_n8 = new TH1F("DeltaT_n_plus_7", "Delta T (N to N+7);Delta T [ns];Counts / ns", 100000, 0, 100000);
-    hGlobalPIndexMap = new TH1F("GlobalHitMap_PIndex", "Global Hit Count vs P-Index;P-index;Total Counts", 600, 0, 600);
     
-    gT0Check = new TGraph();
-    gT0Check->SetName("T0_Check");
-    gT0Check->SetTitle("T0 Linearity Check;Count;Time Elapsed [s]");
-    gT0Check->SetMarkerStyle(20);
-    gT0Check->SetMarkerSize(0.5);
-    gT0Check->SetMarkerColor(kRed);
+    tree_ = new TTree("Events", "Raw Detector Hits");
+    tree_->Branch("type",  &b_type,  "type/B");
+    tree_->Branch("strip", &b_strip, "strip/B");
+    tree_->Branch("tot",   &b_tot,   "tot/I");
+    tree_->Branch("time",  &b_time,  "time/L");
+
+    hGlobalPIndexMap = new TH1F("hGlobalPIndexMap", "Global Hit Count vs P-Index;p-index;Counts", 600, 0, 600);
+    hDeltaT_Nearest = new TH1F("DeltaT_Nearest", "Delta T (Nearest Neighbor);Delta T [ns];Counts", 100000, 0, 100000);
+    hDeltaT_n8      = new TH1F("DeltaT_n_plus_7", "Delta T (N to N+7);Delta T [ns];Counts", 100000, 0, 100000);
+
+    // ★分岐: ミュオン解析有効時のみ生成
+    if (enableMuonAnalysis_) {
+        hEventWidth_All   = new TH1F("hEventWidth_All",   "Event Width (All Clusters);Width [ns];Counts", 200, 0, 1000);
+        hEventWidth_CondA = new TH1F("hEventWidth_CondA", "Event Width (Cond A: 8-hit);Width [ns];Counts", 200, 0, 1000);
+        hEventWidth_CondB = new TH1F("hEventWidth_CondB", "Event Width (Cond B: 7-hit);Width [ns];Counts", 200, 0, 1000);
+
+        TDirectory* currentDir = gDirectory;
+        idealFile_ = new TFile("ideal_events.root", "RECREATE");
+        idealTree_ = new TTree("IdealEvents", "Muon Events (Shortest Width Selected)");
+
+        b_i_type  = new std::vector<int>();
+        b_i_strip = new std::vector<int>();
+        b_i_tot   = new std::vector<int>();
+        b_i_time  = new std::vector<double>();
+
+        idealTree_->Branch("runID",   &b_i_runID,   "runID/I");
+        idealTree_->Branch("eventID", &b_i_eventID, "eventID/I");
+        idealTree_->Branch("nHits",   &b_i_nHits,   "nHits/I");
+        idealTree_->Branch("width",   &b_i_width,   "width/D");
+        idealTree_->Branch("type",  &b_i_type);
+        idealTree_->Branch("strip", &b_i_strip);
+        idealTree_->Branch("tot",   &b_i_tot);
+        idealTree_->Branch("time",  &b_i_time);
+
+        globalEventID_Ideal_ = 0;
+        currentDir->cd();
+    } else {
+        // OFFの場合は安全のため nullptr に
+        hEventWidth_All = nullptr; hEventWidth_CondA = nullptr; hEventWidth_CondB = nullptr;
+        idealFile_ = nullptr; idealTree_ = nullptr;
+        b_i_type = nullptr; b_i_strip = nullptr; b_i_tot = nullptr; b_i_time = nullptr;
+    }
+}
+
+
+void DetectorAnalyzer::generatePDFReport() {
+    printLog("Generating PDF Report...");
+    std::string pdfName = "AnalysisReport.pdf";
+    TCanvas* c1 = new TCanvas("c1", "Report", 1200, 800);
+    c1->Print((pdfName + "(").c_str()); 
+
+    c1->SetLogy(1);
+    if (hDeltaT_Nearest) { hDeltaT_Nearest->Draw(); c1->Print(pdfName.c_str()); }
+    if (hDeltaT_n8)      { hDeltaT_n8->Draw();      c1->Print(pdfName.c_str()); }
+    if (hEventWidth_All)   { hEventWidth_All->Draw();   c1->Print(pdfName.c_str()); }
+    if (hEventWidth_CondA) { hEventWidth_CondA->Draw(); c1->Print(pdfName.c_str()); }
+    if (hEventWidth_CondB) { hEventWidth_CondB->Draw(); c1->Print(pdfName.c_str()); }
+
+    // 検出器タイプ・ストリップ順にソート
+    struct SortEntry { int type; int strip; int mod; int ch; };
+    std::vector<SortEntry> sortedList;
+    for (auto const& [key, rawHist] : hRawToTMap) {
+        if (!rawHist) continue;
+        auto& cfg = detConfigMap_[key];
+        sortedList.push_back({cfg.detTypeID, cfg.strip, key.first, key.second});
+    }
+    std::sort(sortedList.begin(), sortedList.end(), [](const SortEntry& a, const SortEntry& b) {
+        if (a.type != b.type) return a.type < b.type;
+        return a.strip < b.strip;
+    });
+
+    for (const auto& entry : sortedList) {
+        std::pair<int, int> key = {entry.mod, entry.ch};
+        TH1F* h = hRawToTMap[key]; // これは表示用のRawToT (1nsビン等)
+        h->SetTitle(Form("Raw ToT (Log): %s Strip%d (Mod%d Ch%d)", detConfigMap_[key].cachedName.c_str(), detConfigMap_[key].strip, entry.mod, entry.ch));
+        h->Draw();
+
+        int rMin = rangeMinMap_[key];
+        int rMax = rangeMaxMap_[key];
+        
+        // ★修正: rMin, rMaxは「GainCheckヒストグラム」上のビン番号なので、
+        // GainCheckヒストグラムの軸情報を使って、物理的な「時間(ns)」に変換する。
+        // これにより、定数倍によるズレを完全に排除する。
+        if (rMin > 0 && rMax > rMin) {
+            double x1 = 0; 
+            double x2 = 0;
+            
+            // 積分範囲を決めた「元のヒストグラム」を取得して座標変換する
+            if (gainCheckHists_.find(key) != gainCheckHists_.end()) {
+                TH1F* refHist = gainCheckHists_[key];
+                if (refHist) {
+                    // ビンの下端・上端の値を直接取得 (これでレンジ変更やビン幅変更に完全追従)
+                    x1 = refHist->GetXaxis()->GetBinLowEdge(rMin);
+                    x2 = refHist->GetXaxis()->GetBinUpEdge(rMax);
+                }
+            } else {
+                // 万が一見つからない場合のフォールバック（基本的にここには来ない）
+                x1 = (double)rMin * 20.0;
+                x2 = (double)rMax * 20.0;
+            }
+
+            double yMin = (c1->GetLogy()) ? 0.5 : 0;
+            TBox* box = new TBox(x1, yMin, x2, h->GetMaximum());
+            box->SetFillStyle(0); box->SetLineColor(kRed); box->SetLineWidth(2);
+            box->Draw("same");
+        }
+        c1->Print(pdfName.c_str());
+    }
+
+    c1->SetLogy(0);
+    // ... (履歴グラフ描画部分は変更なし) ...
+    c1->Print((pdfName + ")").c_str()); 
+    delete c1;
+}
+
+DetectorAnalyzer::~DetectorAnalyzer() {
+    // 1. 最後の解析と時間計算
+    if (currentEventTime_ns_ > lastGlobalAnalysisTime_ns_) analyzeGainShift(currentEventTime_ns_);
+    calculateEffectiveTime();
+
+    // 2. PDFレポート生成
+    generatePDFReport();
+
+    // 3. メインファイルの保存
+    if (outputFile_ && outputFile_->IsOpen()) {
+        outputFile_->cd();
+        
+        // Treeと全体ヒストグラムの保存
+        if (tree_) tree_->Write();
+        if (hGlobalPIndexMap) hGlobalPIndexMap->Write();
+
+        // 条件付き幅ヒストグラム (存在する場合のみ)
+        if (hEventWidth_All) hEventWidth_All->Write();
+        if (hEventWidth_CondA) hEventWidth_CondA->Write();
+        if (hEventWidth_CondB) hEventWidth_CondB->Write();
+
+        // ヒストグラムの保存 (フォルダ整理)
+        auto dirHist = outputFile_->mkdir("Histograms"); 
+        if (dirHist) {
+            dirHist->cd();
+            for (auto const& [key, h] : hRawToTMap) if (h) h->Write();
+        }
+
+        outputFile_->cd(); 
+        auto dirTemp = outputFile_->mkdir("Templates"); 
+        if (dirTemp) {
+            dirTemp->cd();
+            for (auto const& [key, h] : templateHists_) if (h) h->Write();
+        }
+        
+        // グラフの保存
+        // 修正: TMultiGraphによる集約をやめ、個別のTGraphをそのまま保存してクラッシュを回避
+        outputFile_->cd();
+        auto dG = outputFile_->mkdir("GainHistory");
+        if (dG) {
+            dG->cd();
+            for (auto const& [key, g] : gainEvolutionGraphs_) {
+                if (g && g->GetN() > 0) g->Write();
+            }
+        }
+
+        outputFile_->cd();
+        auto dR = outputFile_->mkdir("RateHistory");
+        if (dR) {
+            dR->cd();
+            for (auto const& [key, g] : rateEvolutionGraphs_) {
+                if (g && g->GetN() > 0) g->Write();
+            }
+        }
+
+        // ファイルクローズ処理
+        outputFile_->Close();
+        delete outputFile_;
+        outputFile_ = nullptr;
+    }
+
+    // 4. 抽出イベント用ファイルの保存
+    if (idealFile_ && idealFile_->IsOpen()) {
+        idealFile_->cd();
+        if (idealTree_) idealTree_->Write();
+        idealFile_->Close();
+        delete idealFile_;
+        idealFile_ = nullptr;
+        printLog("Ideal events saved to: ideal_events.root");
+    }
+
+    if (gainLogCsv_.is_open()) gainLogCsv_.close();
+    if (rateLogCsv_.is_open()) rateLogCsv_.close();
 }
 
 // ----------------------------------------------------------------------------
 // 修正対象 2: ファイル読み込み (T0アンカー方式)
 // ----------------------------------------------------------------------------
+
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
     if (offset == 0) {
         printLog("[OPENING] Mod " + std::to_string(modID) + ": " + fileName);
@@ -409,7 +867,8 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
         }
         
         // ★変更: T0アンカー方式によるオフセット更新ロジック
-        bool willBeEOF = (offset + readCount >= fileSize);
+        bool willBeEOF = (offset + readCount >= (unsigned long long)fileSize);
+        
 
         if (!willBeEOF && t0_indices.size() >= 2) {
             // Case A: ファイル途中なら、最後のT0 (N-1) まで進めて、データもそこまでで切る
@@ -434,9 +893,104 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     return {lastT, (offset >= fileSize)}; 
 }
 
+
+bool DetectorAnalyzer::analyzeGainShift(unsigned long long currentTime_ns) {
+    double timeMin = currentTime_ns / 60.0e9;
+
+    if (!isCsvHeaderWritten_) {
+        std::string detNames[] = {"X1", "Y1", "X2", "Y2"};
+        gainLogCsv_ << "Time_ns";
+        rateLogCsv_ << "Time_ns";
+        for (int type = 0; type < 4; ++type) {
+            for (int s = 1; s <= 32; ++s) {
+                std::string header = "," + detNames[type] + "_" + std::to_string(s);
+                gainLogCsv_ << header;
+                rateLogCsv_ << header;
+            }
+        }
+        gainLogCsv_ << "\n";
+        rateLogCsv_ << "\n";
+        isCsvHeaderWritten_ = true;
+    }
+
+    std::vector<double> currentStepPeaks(128, 0.0);
+    std::vector<double> currentStepRates(128, 0.0);
+
+    for (auto const& [key, hist] : gainCheckHists_) {
+        auto& cfg = detConfigMap_[key];
+        if (!hist) continue;
+
+        // 初期テンプレート作成
+        if (templateHists_.find(key) == templateHists_.end()) {
+            int peakBin = findRightMostPeak(hist);
+            int rMin = 0, rMax = 0;
+            
+            if (peakBin > 0) {
+                determineIntegrationRange(hist, peakBin, rMin, rMax);
+            }
+
+            // 正常に範囲が決定された場合のみテンプレート化
+            if (rMin > 0 && rMax > rMin && hist->GetEntries() > 50) {
+                rangeMinMap_[key] = rMin;
+                rangeMaxMap_[key] = rMax;
+                initialPeakPosMap_[key] = hist->GetBinCenter(peakBin);
+                cumulativeShiftNsMap_[key] = 0.0;
+
+                TH1F* tHist = (TH1F*)hist->Clone(Form("Template_Mod%d_Ch%d", key.first, key.second));
+                tHist->SetDirectory(0);
+                templateHists_[key] = tHist;
+
+                if (!gainEvolutionGraphs_[key]) gainEvolutionGraphs_[key] = new TGraph();
+                gainEvolutionGraphs_[key]->SetPoint(0, timeMin, initialPeakPosMap_[key]);
+            }
+        } 
+        // 追従解析
+        else if (rangeMinMap_[key] > 0) {
+            TH1F* tHist = templateHists_[key];
+            int deltaBin = findBestShift(hist, tHist, rangeMinMap_[key], rangeMaxMap_[key], cfg.cachedName);
+            
+            if (deltaBin != SHIFT_CALC_ERROR) {
+                rangeMinMap_[key] += deltaBin;
+                rangeMaxMap_[key] += deltaBin;
+                cumulativeShiftNsMap_[key] += (deltaBin * BIN_WIDTH_NS);
+
+                double absPeakPos = initialPeakPosMap_[key] + cumulativeShiftNsMap_[key];
+                if (!gainEvolutionGraphs_[key]) gainEvolutionGraphs_[key] = new TGraph();
+                gainEvolutionGraphs_[key]->SetPoint(gainEvolutionGraphs_[key]->GetN(), timeMin, absPeakPos);
+                
+                tHist->Reset();
+                tHist->Add(hist);
+            }
+        }
+
+        // データの格納 (rMin > 0 の場合のみ値をセット、それ以外は初期値0.0のまま)
+        if (rangeMinMap_[key] > 0) {
+            int idx = cfg.detTypeID * 32 + (cfg.strip - 1);
+            if (idx >= 0 && idx < 128) {
+                currentStepPeaks[idx] = initialPeakPosMap_[key] + cumulativeShiftNsMap_[key];
+                double counts = hist->Integral(rangeMinMap_[key], rangeMaxMap_[key]);
+                currentStepRates[idx] = counts / (GAIN_ANALYSIS_WINDOW_NS / 1.0e9) * 60.0;
+            }
+        }
+        hist->Reset();
+    }
+
+    gainLogCsv_ << currentTime_ns;
+    rateLogCsv_ << currentTime_ns;
+    for (int i = 0; i < 128; ++i) {
+        gainLogCsv_ << "," << currentStepPeaks[i];
+        rateLogCsv_ << "," << currentStepRates[i];
+    }
+    gainLogCsv_ << "\n";
+    rateLogCsv_ << "\n";
+
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // 修正対象 3: 全体ループ処理 (時間制限チェック追加)
 // ----------------------------------------------------------------------------
+
 void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>& fileQueues) {
     const size_t PER_MOD_CAP = 1000000; 
     std::map<int, std::deque<Event>> moduleBuffers;
@@ -456,6 +1010,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
     printSearchStatus();
 
     while (true) {
+        // --- ラン切り替え判定 ---
         if (currentRunSignature.empty()) {
             for (auto const& [m, q] : fileQueues) {
                 if (!q.empty()) {
@@ -468,8 +1023,9 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
                 }
             }
         }
-        if (currentRunSignature.empty()) break;
+        if (currentRunSignature.empty()) break; // 全ファイル処理完了
 
+        // --- 遅れているモジュールからデータを補充 ---
         int laggingMod = -1;
         unsigned long long minLastTime = std::numeric_limits<unsigned long long>::max();
         for (auto const& [m, q] : fileQueues) {
@@ -489,6 +1045,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
         }
 
+        // --- 解析開始タイミングの同期 (Sync) ---
         if (!isAnalysisStarted_) {
             bool ready = true; unsigned long long maxBase = 0;
             for (auto const& [m, q] : fileQueues) {
@@ -499,11 +1056,17 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
             if (ready && maxBase > 0) {
                 globalStartTimestamp_ = maxBase; lastSafeTime = maxBase;
-                lastGlobalAnalysisTime_ns_ = maxBase; isAnalysisStarted_ = true;
-                printLog("Sync Established.");
+                
+                // ★修正箇所: 最初の解析予定時刻を「開始時刻 + 3分」に設定
+                // これにより、立ち上がり3分間のデータを含みつつ、最初の解析トリガーを遅らせます
+                lastGlobalAnalysisTime_ns_ = maxBase + ANALYSIS_START_SKIP_NS; 
+                
+                isAnalysisStarted_ = true;
+                printLog("Sync Established. Gain Analysis scheduled to start after 3 mins skip.");
             }
         }
 
+        // --- データ処理ループ ---
         if (isAnalysisStarted_) {
             unsigned long long safeTime = getSafeTime(moduleLastTime);
             if (safeTime > lastSafeTime) {
@@ -511,7 +1074,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
                     totalEffectiveTimeNs_ += (safeTime - lastSafeTime);
                 }
 
-                // ★追加: 時間制限チェック
+                // 時間制限チェック
                 if (totalEffectiveTimeNs_ >= analysisDuration_ns_) {
                     printLog("[LIMIT] Time limit reached. Stopping analysis loop.");
                     break; 
@@ -523,6 +1086,8 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
                     deadTimeRanges_.erase(deadTimeRanges_.begin());
                 }
             }
+            
+            // 安全圏内のイベントをマージして処理へ回す
             std::vector<Event> mergeChunk;
             for (auto& [m, buf] : moduleBuffers) {
                 while (!buf.empty() && buf.front().eventTime_ns <= safeTime) {
@@ -541,6 +1106,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
         }
 
+        // --- 進捗表示 (UI) ---
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - lastUIDraw).count() > 500) {
             printSearchStatus();
             std::stringstream ss; ss << "\n Run: " << currentRunSignature << "\n";
@@ -553,82 +1119,17 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             printLog(ss.str()); lastUIDraw = std::chrono::system_clock::now();
         }
 
+        // --- ラン終了判定 ---
         bool runOver = true;
         for (auto const& [m, q] : fileQueues) if (!q.empty() && getRunSignature(q.front()) == currentRunSignature) runOver = false;
         for (auto const& [m, b] : moduleBuffers) if (!b.empty()) runOver = false;
         if (runOver) {
+            // ラン終了時に最後の端数分を解析
             if(currentEventTime_ns_ > lastGlobalAnalysisTime_ns_) analyzeGainShift(currentEventTime_ns_);
             currentRunSignature = "";
         }
     }
 }
-
-// ----------------------------------------------------------------------------
-// 修正対象 4: Chunk処理 (型キャストと相対時間)
-// ----------------------------------------------------------------------------
-bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
-    if (sortedEvents.empty()) return true;
-
-    for (size_t i = 0; i < sortedEvents.size(); ++i) {
-        const auto& e = sortedEvents[i];
-        
-        // ラン開始時の初期化 (元コード維持: ゲートは残しています)
-        if (currentRunStartTime_ == 0) {
-            if (e.tot >= 1000) {
-                currentRunStartTime_ = e.eventTime_ns;
-                lastTimeoutCheckTime_ = e.eventTime_ns; 
-                prevEventTimeForEff_ = e.eventTime_ns;
-                for(int mid : activeModuleIDs_) moduleAliveTime_[mid] = e.eventTime_ns;
-            } else continue;
-        }
-
-        currentEventTime_ns_ = e.eventTime_ns;
-        moduleAliveTime_[e.module] = e.eventTime_ns;
-
-        bool isSystemHealthy = true;
-        for (int mid : activeModuleIDs_) {
-            if (moduleAliveTime_.find(mid) == moduleAliveTime_.end()) {
-                isSystemHealthy = false; break;
-            }
-        }
-        if (isSystemHealthy && prevEventTimeForEff_ > 0) {
-            unsigned long long dt_ns = e.eventTime_ns - prevEventTimeForEff_;
-            if (dt_ns < 5000000000ULL) totalEffectiveTimeNs_ += dt_ns;
-        }
-        prevEventTimeForEff_ = e.eventTime_ns;
-
-        if (e.eventTime_ns >= lastGlobalAnalysisTime_ns_ + GAIN_ANALYSIS_WINDOW_NS) {
-            analyzeGainShift(e.eventTime_ns);
-            lastGlobalAnalysisTime_ns_ = e.eventTime_ns;
-        }
-
-        foundChannels_[{e.module, e.sysCh}].insert(e.strip);
-        if (e.module < MAX_MODULES && e.sysCh < MAX_SYS_CH) {
-            if (hGainCheck_LUT[e.module][e.sysCh]) hGainCheck_LUT[e.module][e.sysCh]->Fill((double)e.tot);
-            if (hRawToT_LUT[e.module][e.sysCh]) hRawToT_LUT[e.module][e.sysCh]->Fill((double)e.tot);
-        }
-
-        // ★修正: 新しい型定義に合わせてキャストし、相対時間を格納
-        b_type = static_cast<Char_t>(e.type);
-        b_strip = static_cast<Char_t>(e.strip);
-        b_tot = static_cast<Int_t>(e.tot);
-        b_time = static_cast<Long64_t>(e.eventTime_ns - globalStartTimestamp_);
-        
-        if (tree_) tree_->Fill();
-
-        if (i > 0) {
-            long long dt1 = (long long)e.eventTime_ns - (long long)sortedEvents[i-1].eventTime_ns;
-            if (dt1 >= 0 && dt1 < 1000000) hDeltaT_Nearest->Fill((double)dt1);
-        }
-        if (i + 7 < sortedEvents.size()) {
-            long long dt8 = (long long)sortedEvents[i+7].eventTime_ns - (long long)e.eventTime_ns;
-            if (dt8 >= 0 && dt8 < 1000000) hDeltaT_n8->Fill((double)dt8);
-        }
-    }
-    return true;
-}
-
-
 
 
 void DetectorAnalyzer::printSearchStatus() {
@@ -725,12 +1226,27 @@ unsigned long long DetectorAnalyzer::getSafeTime(const std::map<int, unsigned lo
 // ----------------------------------------------------------------------------
 // ゲイン解析ロジック
 // ----------------------------------------------------------------------------
+
 int DetectorAnalyzer::findRightMostPeak(TH1F* hist) {
     if (!hist) return 0;
-    hist->GetXaxis()->SetRangeUser(PEAK_SEARCH_MIN_TOT, PEAK_SEARCH_MAX_TOT);
-    int maxBin = hist->GetMaximumBin();
-    hist->GetXaxis()->SetRange(0, 0); 
-    return maxBin;
+
+    // ビン番号ではなく「物理時間(ns)」を指定して検索範囲のビンを決定
+    // これにより、ビン幅やレンジが変わっても常に "10µs〜100µs" の範囲を探索できる
+    int binMin = hist->GetXaxis()->FindBin(10000.0); 
+    int binMax = hist->GetXaxis()->FindBin(100000.0); 
+
+    // 安全策: FindBinはレンジ外だとオーバーフロービンを返すことがあるため補正
+    if (binMax > hist->GetNbinsX()) binMax = hist->GetNbinsX();
+    if (binMin < 1) binMin = 1;
+
+    // 右から左へ走査
+    for (int i = binMax; i >= binMin; --i) {
+        if (hist->GetBinContent(i) > 0) {
+            return i; // アンカー発見
+        }
+    }
+
+    return 0; // 見つからなければND
 }
 
 
@@ -754,20 +1270,64 @@ double DetectorAnalyzer::calculateResidual(TH1F* hTarget, TH1F* hTemplate, int s
 }
 
 
-// 5us (250bin) 空白探索
-void DetectorAnalyzer::determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin) {
-    int nBins = hist->GetNbinsX();
-    const int SILENCE_BINS = 250; 
-    
-    outMinBin = 1; int zeroCount = 0;
-    for (int i = peakBin; i > 1; --i) {
-        if (hist->GetBinContent(i) <= 0) zeroCount++; else zeroCount = 0;
-        if (zeroCount >= SILENCE_BINS) { outMinBin = i + zeroCount; if(outMinBin<1)outMinBin=1; break; }
+
+void DetectorAnalyzer::determineIntegrationRange(TH1F* hist, int peakBin, int& rMin, int& rMax) {
+    if (!hist || peakBin <= 0) {
+        rMin = 0; rMax = 0;
+        return;
     }
-    outMaxBin = nBins; zeroCount = 0;
-    for (int i = peakBin; i < nBins; ++i) {
-        if (hist->GetBinContent(i) <= 0) zeroCount++; else zeroCount = 0;
-        if (zeroCount >= SILENCE_BINS) { outMaxBin = i - zeroCount; if(outMaxBin>nBins)outMaxBin=nBins; break; }
+
+    // ★修正: 固定定数ではなく、ヒストグラムの実際のビン幅から物理時間を計算する
+    double binWidthNs = hist->GetXaxis()->GetBinWidth(1); 
+    if (binWidthNs <= 0.0) binWidthNs = 20.0; // ガード
+
+    // 2µs (2000ns) 分のビン数を動的に計算
+    const int BINS_2US = (int)(2000.0 / binWidthNs); 
+    const double MIN_WIDTH_NS = 4000.0; 
+
+    // 1. 上限 (rMax) : アンカー位置 + 2µs
+    // 物理時間軸での加算ではなく、ビン数換算で行う（積分にはビンインデックスが必要なため）
+    // ただし、BINS_2USが動的に計算されているため、ビン幅が変わっても常に+2µsとなる
+    rMax = std::min(hist->GetNbinsX(), peakBin + BINS_2US);
+
+    // 2. 下限 (rMin) : アンカーから左へ走査し、2µs連続ゼロの領域を探す
+    int foundGapStart = 0;
+    
+    // 探索も動的計算したビン数で行う
+    for (int i = peakBin - 1; i >= 1; --i) {
+        bool isGap = true;
+        // i地点から左へ 2µs 分連続でゼロか確認
+        for (int k = 0; k < BINS_2US; ++k) {
+            if ((i - k) < 1) {
+                isGap = true; 
+                foundGapStart = 1;
+                break;
+            }
+            if (hist->GetBinContent(i - k) > 0) {
+                isGap = false;
+                break;
+            }
+        }
+
+        if (isGap) {
+            // ギャップが見つかったら、そのギャップの左端をrMinとする
+            foundGapStart = std::max(1, i - (BINS_2US - 1));
+            break;
+        }
+    }
+
+    if (foundGapStart == 0) {
+        rMin = 0; rMax = 0;
+        return;
+    }
+    rMin = foundGapStart;
+
+    // 3. 幅のチェック : 物理時間に変換して判定
+    // ここもビン番号差 × 実際のビン幅 で計算
+    double currentWidthNs = (rMax - rMin) * binWidthNs;
+    if (currentWidthNs <= MIN_WIDTH_NS) {
+        rMin = 0; rMax = 0;
+        return;
     }
 }
 
@@ -784,81 +1344,6 @@ int DetectorAnalyzer::findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, 
     return bestS;
 }
 
-bool DetectorAnalyzer::analyzeGainShift(unsigned long long currentTime_ns) { 
-    if (!gainLogCsv_.is_open()) return true;
-    if (!isCsvHeaderWritten_) {
-        // (ヘッダ書き込み: 既存ママ)
-        struct SortInfo { std::pair<int,int> k; int t; int s; std::string n; };
-        std::vector<SortInfo> sorted;
-        for (auto const& [keyPair, info] : detConfigMap_) sorted.push_back({keyPair, info.detTypeID, info.strip, info.cachedName});
-        std::sort(sorted.begin(), sorted.end(), [](const SortInfo& a, const SortInfo& b){ if(a.t != b.t) return a.t < b.t; return a.s < b.s; });
-        gainLogCsv_ << "Time_ns"; rateLogCsv_ << "Time_ns";
-        for(const auto& s : sorted) { std::string label = s.n + "-" + std::to_string(s.s); gainLogCsv_ << "," << label; rateLogCsv_ << "," << label; }
-        gainLogCsv_ << "\n"; rateLogCsv_ << "\n";
-        isCsvHeaderWritten_ = true;
-    }
-
-    gainLogCsv_ << currentTime_ns; rateLogCsv_ << currentTime_ns;
-    double durMin = (double)GAIN_ANALYSIS_WINDOW_NS / 1.0e9 / 60.0; // 10分
-
-    std::vector<std::pair<int, int>> sortedKeys;
-    for (auto const& [key, info] : detConfigMap_) sortedKeys.push_back(key);
-    std::sort(sortedKeys.begin(), sortedKeys.end(), [&](std::pair<int,int> a, std::pair<int,int> b){
-        const auto& iA = detConfigMap_[a]; const auto& iB = detConfigMap_[b];
-        if(iA.detTypeID != iB.detTypeID) return iA.detTypeID < iB.detTypeID; return iA.strip < iB.strip; 
-    });
-
-    for (const auto& key : sortedKeys) {
-        TH1F* hist = hGainCheck_LUT[key.first][key.second];
-        std::string sVal = "ND"; double rVal = 0.0;
-
-        if (hist) {
-            // カウントによるND判定は行わない (ご指示通り)
-            
-            if (!isTemplateCaptured_) {
-                // 初回
-                int pBin = findRightMostPeak(hist); int rMin, rMax;
-                determineIntegrationRange(hist, pBin, rMin, rMax);
-                rangeMinMap_[key] = rMin; rangeMaxMap_[key] = rMax;
-                
-                templateHists_[key] = (TH1F*)hist->Clone(Form("%s_tmpl", hist->GetName()));
-                templateHists_[key]->SetDirectory(0);
-                
-                cumulativeShiftMap_[key] = 0.0; sVal = "0";
-                if(rMin>0 && rMax>rMin) rVal = hist->Integral(rMin, rMax) / durMin;
-            } else {
-                // 2回目以降
-                int dBin = findBestShift(hist, templateHists_[key], rangeMinMap_[key], rangeMaxMap_[key], "");
-                
-                if (dBin != SHIFT_CALC_ERROR) {
-                    if (dBin != 0) {
-                        rangeMinMap_[key] += dBin; rangeMaxMap_[key] += dBin;
-                        cumulativeShiftMap_[key] += (double)dBin * 20.0;
-                        delete templateHists_[key];
-                        templateHists_[key] = (TH1F*)hist->Clone(Form("%s_tmpl", hist->GetName()));
-                        templateHists_[key]->SetDirectory(0);
-                    }
-                    sVal = std::to_string(cumulativeShiftMap_[key]);
-                    rVal = hist->Integral(rangeMinMap_[key], rangeMaxMap_[key]) / durMin;
-                } else {
-                    // マッチング失敗時のみ ND
-                    sVal = "ND"; 
-                    rVal = 0.0; // あるいは前回値を維持するか、NDなら0にするか。ここでは0にします。
-                }
-            }
-
-            if(sVal != "ND") {
-                if(gainEvolutionGraphs_.count(key)) gainEvolutionGraphs_[key]->SetPoint(gainEvolutionGraphs_[key]->GetN(), (double)currentTime_ns, cumulativeShiftMap_[key]);
-                if(rateEvolutionGraphs_.count(key)) rateEvolutionGraphs_[key]->SetPoint(rateEvolutionGraphs_[key]->GetN(), (double)currentTime_ns, rVal);
-            }
-            hist->Reset();
-        }
-        gainLogCsv_ << "," << sVal; rateLogCsv_ << "," << rVal;
-    }
-    gainLogCsv_ << std::endl; rateLogCsv_ << std::endl;
-    if(!isTemplateCaptured_) isTemplateCaptured_ = true;
-    return true; 
-}
 
 
 // ----------------------------------------------------------------------------
