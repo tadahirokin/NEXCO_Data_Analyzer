@@ -38,30 +38,27 @@ const int Y_CHANNEL_OFFSET = 64;
 
 // 閾値設定
 const int TOT_THRESHOLD_NS = 1000; 
-
-
-
-const unsigned long long ANALYSIS_START_SKIP_NS = 180000000000ULL; // 3分 (3 * 60 * 10^9)
-// 解析ウィンドウ設定 (10分)
-const unsigned long long GAIN_ANALYSIS_WINDOW_NS = 600000000000ULL; 
+const unsigned long long ANALYSIS_START_SKIP_NS = 180000000000ULL; // 3分
+const unsigned long long GAIN_ANALYSIS_WINDOW_NS = 600000000000ULL; // 10分
 const unsigned long long CHANNEL_TIMEOUT_NS = 5000000000ULL;       // 5秒
 
-// ゲインモニタリング解像度 (20ns/bin)
-const int MONITOR_HIST_BINS = 4000;
+// --- 仕様変更箇所: ゲインモニタリング & 死活監視設定 ---
+const unsigned long long MODULE_DEATH_TIMEOUT_NS = 1000000000ULL;   // 1.0秒
+
+// ゲインモニタリング解像度 (20nsビン幅)
+const int MONITOR_HIST_BINS = 5000;      // 100,000ns / 5000 = 20ns
 const double MONITOR_HIST_MAX_TOT = 100000.0;
 const double BIN_WIDTH_NS = 20.0; 
+const double MIN_INTEGRATION_WIDTH_NS = 6000.0; // 6µs
 
-// ピーク探索用初期範囲
-const double PEAK_SEARCH_MIN_TOT = 30000.0;
-const double PEAK_SEARCH_MAX_TOT = 80000.0;
-const int SILENCE_THRESHOLD_BINS = 5; // 連続ゼロ判定
-
-// 互換性のために必要
-const int COVELL_WINDOW_NS = 1000;
-
-// マッチング探索範囲
-const int MATCHING_SEARCH_RANGE_BINS = 50; 
+// ピーク探索用
+const double PEAK_SEARCH_MIN_TOT = 10000.0; // 10µs
+const int REBIN_FACTOR = 1;                 
+const int MATCHING_SEARCH_RANGE_BINS = 25;  // ±25 bins (±500ns)
 const int SHIFT_CALC_ERROR = -999999;
+
+const int COVELL_WINDOW_NS = 1000;
+const int SILENCE_THRESHOLD_BINS = 5; 
 
 class DetectorAnalyzer {
 public:
@@ -91,9 +88,7 @@ public:
     DetectorAnalyzer(int timeWindow_ns, const std::string& outputFileName);
     ~DetectorAnalyzer();
 
-    // ★モード切替スイッチ
     void setMuonAnalysisMode(bool enable);
-
     void loadConversionFactorsFromCSV(const std::string& csvFileName, const std::string& detName, int moduleID);
     void loadOfflineStripList(const std::string& csvFileName);
     void loadAndSortFiles(const std::string& directory, std::map<int, std::deque<std::string>>& fileQueues);
@@ -105,21 +100,19 @@ public:
 
 private:
     void setupTree();
-    void setupIdealTree(); // ミュオン解析用Treeの初期化ヘルパー
 
-    // ★モード管理フラグ
+    unsigned long long findNextT0(const std::string& fileName, int modID, long long& offset);
+    
     bool enableMuonAnalysis_;
 
-    // ★処理の実装分離
-    bool processChunk_Fast(const std::vector<Event>& sortedEvents); // ゲイン解析のみ (爆速)
-    bool processChunk_Muon(const std::vector<Event>& sortedEvents); // 自動抽出あり (高負荷)
-    bool processChunk(const std::vector<Event>& sortedEvents);      // エントリポイント
+    bool processChunk_Fast(const std::vector<Event>& sortedEvents); 
+    bool processChunk_Muon(const std::vector<Event>& sortedEvents); 
+    bool processChunk(const std::vector<Event>& sortedEvents);      
 
-    // 理想イベント抽出用ファイル・Tree
     TFile* idealFile_;
     TTree* idealTree_;
 
-    // idealTree用バッファ
+    // Ideal Tree用変数 (Muon解析)
     int    b_i_runID;
     int    b_i_eventID;
     int    b_i_nHits;
@@ -129,27 +122,23 @@ private:
     std::vector<int>    *b_i_tot;
     std::vector<double> *b_i_time;
 
-    // 抽出アルゴリズム用バッファ
     std::deque<Event> analysisBuffer_;
     int globalEventID_Ideal_;
 
-    // 幅ヒストグラム
     TH1F *hEventWidth_All;
     TH1F *hEventWidth_CondA;
     TH1F *hEventWidth_CondB;
 
-    // アルゴリズム用メソッド
     void processEventExtraction(); 
     bool checkConditionA(const std::deque<Event>& buf, size_t startIdx, double& outWidth);
     bool checkConditionB(const std::deque<Event>& buf, size_t startIdx, double& outWidth);
     bool hasAdjacentPair(const std::vector<int>& strips);
     bool isAdjacentToOffline(int strip, int detTypeID);
 
-    // PDF生成
     void generatePDFReport();
     
-    // 同期・読み込み
     bool syncDataStream(std::ifstream& ifs, long long& skippedBytes);
+    
     std::pair<unsigned long long, bool> readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset);
     
     unsigned long long getSafeTime(const std::map<int, unsigned long long>& lastTimes);
@@ -157,35 +146,35 @@ private:
     short getRunID(const std::string& prefix);
     std::string parseRunPrefix(const std::string& fullPath);
     
-    // ゲイン解析ロジック
+    // ゲイン解析関連
     bool analyzeGainShift(unsigned long long currentTime_ns);
     int findRightMostPeak(TH1F* hist); 
     void determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin);
     
     double calculatePeakAreaCovell(TH1F* hist, double peakPos);
-    double calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax);
-    int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string& debugLabel);
+    double calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax, double scale);
+    int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string& label);
     
     void printFileTail(const std::string& filePath, long long currentOffset);
     void calculateEffectiveTime();
     void printLog(const std::string& msg) { std::cout << msg << std::endl; }
 
-    // --- メンバ変数 ---
+    std::map<std::pair<int, int>, double> templateDurationMap_; 
+
     int timeWindow_ns_;
     TFile* outputFile_;
     TTree* tree_;
-    TH1F *hDeltaT_Nearest, *hDeltaT_n8, *hGlobalPIndexMap;
+    TH1F *hDeltaT_Neighbor;
+    TH1F *hDeltaT_n8, *hGlobalPIndexMap;
     TGraph* gT0Check;
     int t0GlobalCount_;
     unsigned long long firstT0Time_;
 
-    // TTreeバッファ
     Char_t   b_type;   
     Char_t   b_strip;  
     Int_t    b_tot;    
     Long64_t b_time;   
 
-    // ゲイン追従・解析用
     std::map<std::pair<int, int>, double> initialPeakPosMap_;    
     std::map<std::pair<int, int>, double> cumulativeShiftNsMap_; 
     std::map<std::pair<int, int>, int>    rangeMinMap_;          
@@ -212,11 +201,13 @@ private:
     std::set<std::pair<int, int>> ignoredMonitorChannels_; 
     std::set<std::pair<int, int>> offlineStrips_;
 
+    // モジュール死活監視 & 異常制御用変数
     std::map<int, unsigned long long> channelLastRefHitTime_; 
-    unsigned long long lastTimeoutCheckTime_;
-
     bool isCurrentRunDead_; 
+    bool abortCurrentRun_; // ★追加: T0異常によるラン強制終了フラグ
     unsigned long long currentRunDeathTime_;
+    
+    unsigned long long lastTimeoutCheckTime_;
     unsigned long long currentRunStartTime_; 
     
     unsigned long long totalEffectiveTimeNs_; 
@@ -230,9 +221,6 @@ private:
     unsigned long long prevEventTimeForEff_;
 
     std::map<int, long long> currentFileOffsets_;
-    std::map<int, unsigned long long> baseTimeMap_;
-    std::map<int, bool> hasSeenTimeHeaderMap_;
-
     std::vector<std::pair<unsigned long long, unsigned long long>> deadTimeRanges_;
 
     std::ofstream gainLogCsv_;
@@ -254,6 +242,13 @@ private:
     std::map<std::pair<int, int>, TGraph*> rateEvolutionGraphs_;
     
     std::map<std::pair<int, int>, double> cumulativeShiftMap_; 
+
+    // モジュール独立状態管理
+    std::map<int, unsigned long long> lastT0_; 
+    std::map<int, bool> hasDataAligned_; 
+    std::map<int, bool> hasFoundT0_;     
+    std::map<int, bool> hasSeenTimeHeaderMap_; // 追加
+    std::map<int, unsigned long long> baseTimeMap_; // 追加
 };
 
 #endif
