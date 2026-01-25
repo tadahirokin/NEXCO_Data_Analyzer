@@ -99,6 +99,9 @@ public:
     bool isAnalysisStarted_; 
 
 private:
+    std::map<int, unsigned long long> lastRawT0_; // 前回の「生」のT0を保持
+    std::map<int, long long> moduleOffsets_;      // 各モジュールの累積オフセット
+    unsigned long long finalTotalTimeNs_ = 0;
     void setupTree();
 
     unsigned long long findNextT0(const std::string& fileName, int modID, long long& offset);
