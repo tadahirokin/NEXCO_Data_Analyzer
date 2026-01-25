@@ -156,7 +156,7 @@ private:
     
     double calculatePeakAreaCovell(TH1F* hist, double peakPos);
     double calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax, double scale);
-    int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string& label);
+    int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax);
     
     void printFileTail(const std::string& filePath, long long currentOffset);
     void calculateEffectiveTime();

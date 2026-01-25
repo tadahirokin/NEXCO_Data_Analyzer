@@ -175,16 +175,15 @@ DetectorAnalyzer::~DetectorAnalyzer() {
 
 static std::map<int, bool> g_allowNextT0Jump; 
 
+
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
     std::ifstream ifs(fileName, std::ios::binary);
     if (!ifs.is_open()) return {lastT0_[modID], true};
 
-    // ファイルサイズと終端の確認
     ifs.seekg(0, std::ios::end);
     long long fileSize = static_cast<long long>(ifs.tellg());
     if (offset >= fileSize) return {lastT0_[modID], true};
 
-    // 64MB一括読み込み
     const size_t CHUNK_SIZE = 64 * 1024 * 1024;
     ifs.seekg(offset, std::ios::beg);
     std::vector<unsigned char> buf(CHUNK_SIZE);
@@ -192,12 +191,7 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     size_t count = static_cast<size_t>(ifs.gcount());
     bool isEOF = (offset + static_cast<long long>(count) >= fileSize);
 
-    if (count < 80 && !hasDataAligned_[modID]) {
-        offset += static_cast<long long>(count);
-        return {lastT0_[modID], isEOF};
-    }
-
-    // --- Phase 1: 物理アライメント探索 (10パケット連続ヘッダ確認) ---
+    // --- Phase 1: 物理アライメント探索 ---
     if (!hasDataAligned_[modID]) {
         for (size_t i = 0; i + 80 <= count; ++i) {
             if (buf[i] == 0x69 || buf[i] == 0x6a) {
@@ -210,9 +204,8 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                 if (match) {
                     hasDataAligned_[modID] = true;
                     offset += static_cast<long long>(i);
-                    // 同期直後はオフセットもリセット（新しいファイルの基準）
-                    moduleOffsets_[modID] = 0; 
-                    return {0, false}; 
+                    // ファイル先頭での同期時は、このファイルの基準時刻を待つためにオフセットは維持
+                    return {lastT0_[modID], false}; 
                 }
             }
         }
@@ -228,7 +221,6 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
 
     while (i + 8 <= count) {
         unsigned char header = buf[i];
-
         if (header != 0x69 && header != 0x6a) {
             hasDataAligned_[modID] = false; 
             hasFoundT0_[modID] = false; 
@@ -236,88 +228,68 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             return {ultimateT0_corrected, isEOF};
         }
 
-        // [T0 パケット処理]
-        if (header == 0x69) { 
+        if (header == 0x69) { // T0 パケット
             unsigned char* p = &buf[i + 1];
-            // --- 生時刻のデコード (raw_t) ---
             unsigned long long raw_t = ((unsigned long long)p[0] << 24 | (unsigned long long)p[1] << 16 | 
                                        (unsigned long long)p[2] << 8 | (unsigned long long)p[3]) * 1000000000ULL + 
                                        ((unsigned long long)p[4] << 2 | (unsigned long long)(p[5] & 0xC0) >> 6) * 1000000ULL + 
                                        ((unsigned long long)(p[5] & 0x3F) << 2 | (unsigned long long)(p[6] & 0xC0) >> 6);
 
-            // --- ワープ検知 & 10パケット検証ロジック ---
+            // ワープ検知と補正
             if (hasFoundT0_[modID]) {
-                // lastRawT0_[modID] との差分を確認 (1msリズムから外れたか)
                 long long diff = (long long)raw_t - (long long)lastRawT0_[modID];
-                
                 if (std::abs(diff - 1000000LL) > 500000LL) {
-                    // ワープの疑いあり。未来を覗き見して検証
-                    std::streampos currentFilePos = ifs.tellg(); // チャンク読み込み後の位置
-                    // 実際の位置 = offset + 現在のバッファ内位置(i) + 次のパケットへ(8)
-                    ifs.seekg(offset + i + 8, std::ios::beg); 
-                    
+                    // 10パケット未来検証
+                    std::streampos currentFilePos = ifs.tellg();
+                    ifs.seekg(offset + i + 8, std::ios::beg);
                     int validT0Count = 0;
                     unsigned long long tempPrevRaw = raw_t;
                     unsigned char v[8];
-                    
-                    // 次のT0を10個見つけてリズムを確認
                     while (validT0Count < 10 && ifs.read((char*)v, 8)) {
                         if (v[0] == 0x69) {
                             unsigned long long vt = ((unsigned long long)v[1] << 24 | (unsigned long long)v[2] << 16 | 
                                                     (unsigned long long)v[3] << 8 | (unsigned long long)v[4]) * 1000000000ULL + 
                                                     ((unsigned long long)v[5] << 2 | (unsigned long long)(v[6] & 0xC0) >> 6) * 1000000ULL + 
                                                     ((unsigned long long)(v[6] & 0x3F) << 2 | (unsigned long long)(v[7] & 0xC0) >> 6);
-                            
                             if (std::abs((long long)(vt - tempPrevRaw) - 1000000LL) < 100000LL) {
-                                validT0Count++;
-                                tempPrevRaw = vt;
+                                validT0Count++; tempPrevRaw = vt;
                             } else { break; }
                         }
                     }
-                    ifs.seekg(currentFilePos, std::ios::beg); // 元の位置（チャンク末端）に戻す
-                    ifs.clear();
-
+                    ifs.seekg(currentFilePos, std::ios::beg); ifs.clear();
                     if (validT0Count >= 10) {
-                        // 本物のワープ確定。新しいオフセットを算出
-                        // オフセット = 生時刻 - 本来あるべき時刻(前回生時刻 + 1ms)
                         long long jump = (long long)raw_t - ((long long)lastRawT0_[modID] + 1000000LL);
                         moduleOffsets_[modID] += jump;
-                        
-                        printLog("[WARP RECOVERY] Mod " + std::to_string(modID) + " Jump detected. New total offset applied.");
+                        printLog("[WARP RECOVERY] Mod " + std::to_string(modID) + " Jump detected. Offset updated.");
                     }
                 }
             }
 
-            // --- 補正後時刻の計算 ---
             unsigned long long corrected_t = raw_t - moduleOffsets_[modID];
-            
             i += 8;
-            if (corrected_t <= lastT0_[modID] && lastT0_[modID] != 0) continue; // 重複排除
+            if (corrected_t <= lastT0_[modID] && lastT0_[modID] != 0) continue;
 
             hasFoundT0_[modID] = true;
-            lastRawT0_[modID] = raw_t;       // 次回判定用に「生」を保存
-            lastT0_[modID] = corrected_t;    // クラス全体には「補正後」を報告
+            lastRawT0_[modID] = raw_t;
+            lastT0_[modID] = corrected_t;
             ultimateT0_corrected = corrected_t;
             currentBaseTime_corrected = corrected_t;
             continue;
         }
 
-        // [Event パケット処理]
-        if (header == 0x6a) { 
+        if (header == 0x6a) { // Event パケット
             if (hasFoundT0_[modID] && currentBaseTime_corrected > 0) {
                 unsigned char* p = &buf[i + 1];
                 unsigned int tof = ((unsigned int)p[0] << 16 | (unsigned int)p[1] << 8 | (unsigned int)p[2]);
                 unsigned int pw  = ((unsigned int)p[3] << 12 | (unsigned int)p[4] << 4 | (unsigned int)(p[5] & 0xF0) >> 4);
                 int sys = static_cast<int>(((p[5] & 0x0F) << 8) | p[6]);
                 
-                // すでに補正済みの currentBaseTime_corrected を使うので、evTime も自動的に補正される
                 unsigned long long evTime = currentBaseTime_corrected + static_cast<unsigned long long>(tof) - static_cast<unsigned long long>(pw);
                 rawEvents.push_back({0, sys, modID, evTime, static_cast<int>(pw), sys});
             }
             i += 8;
         }
     }
-
     offset += static_cast<long long>(count);
     return {ultimateT0_corrected, isEOF};
 }
@@ -402,6 +374,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
     for (int m : activeModuleIDs_) {
         lastT0_[m] = 0; hasDataAligned_[m] = false; hasFoundT0_[m] = false;
         moduleLastTime[m] = 0; currentFileOffsets_[m] = 0;
+        lastRawT0_[m] = 0; moduleOffsets_[m] = 0;
     }
 
     std::string currentRunSignature = "";
@@ -415,7 +388,8 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         }
         if (lagMod == -1) break; 
 
-        if (moduleBuffers[lagMod].size() < PER_MOD_CAP && !fileQueues[lagMod].empty()) {
+        // データ読み込み
+        if (lagMod != -1 && moduleBuffers[lagMod].size() < PER_MOD_CAP && !fileQueues[lagMod].empty()) {
             if (getRunSignature(fileQueues[lagMod].front()) == currentRunSignature) {
                 std::vector<Event> temp;
                 auto res = readEventsFromFile(fileQueues[lagMod].front(), lagMod, temp, currentFileOffsets_[lagMod]);
@@ -424,7 +398,7 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
                     processedDataSize_ += (64 * 1024 * 1024);
                 }
                 moduleLastTime[lagMod] = res.first;
-                if (res.second) { // EOF
+                if (res.second) {
                     printLog("[FILE DONE] " + fileQueues[lagMod].front());
                     fileQueues[lagMod].pop_front(); currentFileOffsets_[lagMod] = 0;
                     hasDataAligned_[lagMod] = false; hasFoundT0_[lagMod] = false; 
@@ -432,10 +406,18 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
         }
 
+        // 同期送出
         unsigned long long safeTime = getSafeTime(moduleLastTime);
         if (safeTime > 0) {
             if (absoluteStartSafeTime == 0) absoluteStartSafeTime = safeTime;
             totalEffectiveTimeNs_ = safeTime - absoluteStartSafeTime;
+
+            // ★ 修正1: 制限時間に達したら即座に終了
+            if (totalEffectiveTimeNs_ >= analysisDuration_ns_) {
+                printLog("[LIMIT] Analysis duration reached. Stopping...");
+                break;
+            }
+
             std::vector<Event> chunk;
             for (int m : activeModuleIDs_) {
                 while (!moduleBuffers[m].empty() && moduleBuffers[m].front().eventTime_ns <= safeTime) {
@@ -449,17 +431,39 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
             }
         }
 
-        // 200ms UIガード
+        // UI表示 (1秒周期)
         auto now = std::chrono::system_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUIDraw).count() > 200) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUIDraw).count() > 1000) {
             lastUIDraw = now;
-            double progress = (totalDataSize_ > 0) ? (double)processedDataSize_ / totalDataSize_ * 100.0 : 0.0;
-            printf("\r[%5.1f%%] LiveTime: %6.2f min | M0:%7zu M1:%7zu | %s ", 
-                   progress, (double)totalEffectiveTimeNs_/1e9/60.0, 
-                   moduleBuffers[0].size(), moduleBuffers[1].size(), currentRunSignature.c_str());
+
+            // ★ 修正2: 進捗率の計算ロジック
+            double progress = 0.0;
+            if (analysisDuration_ns_ < std::numeric_limits<unsigned long long>::max()) {
+                progress = (double)totalEffectiveTimeNs_ / (double)analysisDuration_ns_ * 100.0;
+            } else if (totalDataSize_ > 0) {
+                progress = (double)processedDataSize_ / (double)totalDataSize_ * 100.0;
+            }
+            if (progress > 100.0) progress = 100.0;
+
+            auto getBar = [&](int modID) {
+                int width = 10;
+                double r = (double)moduleBuffers[modID].size() / PER_MOD_CAP;
+                int filled = (int)(r * width); if (filled > width) filled = width;
+                std::string b = "[";
+                for(int k=0; k<width; ++k) b += (k < filled ? "#" : ".");
+                return b + "]";
+            };
+
+            std::string curF = (lagMod != -1 && !fileQueues[lagMod].empty()) ? 
+                               std::filesystem::path(fileQueues[lagMod].front()).filename().string() : "---";
+
+            printf("\r[%5.1f%%] %-25s | Live:%6.2f min | M0:%s M1:%s | %s ", 
+                   progress, curF.substr(0, 24).c_str(), (double)totalEffectiveTimeNs_/1e9/60.0, 
+                   getBar(0).c_str(), getBar(1).c_str(), currentRunSignature.c_str());
             std::cout << std::flush;
         }
     }
+    finalTotalTimeNs_ = totalEffectiveTimeNs_; // 終了時のライブタイムを保存
 }
 
 bool DetectorAnalyzer::processChunk(const std::vector<Event>& sortedEvents) {
@@ -654,8 +658,8 @@ bool DetectorAnalyzer::analyzeGainShift(unsigned long long currentTime_ns) {
         // テンプレートマッチング
         else if (rangeMinMap_[key] > 0) {
             TH1F* tHist = templateHists_[key];
-            int deltaBin = findBestShift(hist, tHist, rangeMinMap_[key], rangeMaxMap_[key], cfg.cachedName);
-            
+            int deltaBin = findBestShift(hist, tHist, rangeMinMap_[key], rangeMaxMap_[key]);
+
             if (deltaBin != SHIFT_CALC_ERROR) {
                 rangeMinMap_[key] += deltaBin;
                 rangeMaxMap_[key] += deltaBin;
@@ -718,7 +722,7 @@ void DetectorAnalyzer::determineIntegrationRange(TH1F* hist, int peakBin, int& r
     if (widthNs <= 4020.0) { rMin = 0; rMax = 0; }
 }
 
-int DetectorAnalyzer::findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax, const std::string& label) {
+int DetectorAnalyzer::findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax) {
     double minRes = 1.79769e+308; int bestS = SHIFT_CALC_ERROR; bool found = false;
     const int SEARCH_RANGE = 25; 
     double intTarget = hTarget->Integral(binMin, binMax);
