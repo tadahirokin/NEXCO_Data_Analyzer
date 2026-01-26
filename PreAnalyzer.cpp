@@ -22,7 +22,7 @@ void PreAnalyzer(bool debugMode = true) {
 
     // 時間制限設定
     if (debugMode) {
-        analyzer.setTimeLimitMinutes(60.0);
+        analyzer.setTimeLimitMinutes(120.0);
     } else {
         analyzer.setTimeLimitMinutes(-1.0); // 無制限
     }
