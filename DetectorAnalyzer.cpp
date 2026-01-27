@@ -343,26 +343,17 @@ bool DetectorAnalyzer::isAdjacentToOffline(int strip, int detTypeID) {
     return false;
 }
 
-// ----------------------------------------------------------------------------
-// ゲイン解析 (テンプレートマッチング)
-// ----------------------------------------------------------------------------
 
-
-// ----------------------------------------------------------------------------
-// 1. readEventsFromFile (シーク方式による復元版)
-//    現在の最新コードの同名関数を、このコードで上書きしてください。
-//    これにより、バッファ境界バグを回避しつつ、ヒストグラム機能等は維持されます。
-// ----------------------------------------------------------------------------
 std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset) {
     std::ifstream ifs(fileName, std::ios::binary);
     if (!ifs.is_open()) return {lastT0_[modID], true};
 
-    // ファイルサイズと終端の確認
+    // --- ファイルサイズと終端の確認 ---
     ifs.seekg(0, std::ios::end);
     long long fileSize = static_cast<long long>(ifs.tellg());
     if (offset >= fileSize) return {lastT0_[modID], true};
 
-    // 64MB一括読み込み
+    // --- 64MB一括読み込み ---
     const size_t CHUNK_SIZE = 64 * 1024 * 1024;
     ifs.seekg(offset, std::ios::beg);
     std::vector<unsigned char> buf(CHUNK_SIZE);
@@ -370,12 +361,15 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     size_t count = static_cast<size_t>(ifs.gcount());
     bool isEOF = (offset + static_cast<long long>(count) >= fileSize);
 
+    // バッファサイズ不足時の処理
     if (count < 80 && !hasDataAligned_[modID]) {
         offset += static_cast<long long>(count);
         return {lastT0_[modID], isEOF};
     }
 
-    // --- Phase 1: 物理アライメント探索 (10パケット連続ヘッダ確認) ---
+    // =========================================================
+    // Phase 1: 物理アライメント探索 (10パケット連続ヘッダ確認)
+    // =========================================================
     if (!hasDataAligned_[modID]) {
         for (size_t i = 0; i + 80 <= count; ++i) {
             if (buf[i] == 0x69 || buf[i] == 0x6a) {
@@ -388,8 +382,7 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                 if (match) {
                     hasDataAligned_[modID] = true;
                     offset += static_cast<long long>(i);
-                    // 同期直後はオフセットもリセット（新しいファイルの基準）
-                    moduleOffsets_[modID] = 0; 
+                    moduleOffsets_[modID] = 0; // ファイル切り替え直後は仮リセット
                     return {0, false}; 
                 }
             }
@@ -399,7 +392,9 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
         return {lastT0_[modID], isEOF};
     }
 
-    // --- Phase 2: 高速デコード ---
+    // =========================================================
+    // Phase 2: 高速パケットデコード処理
+    // =========================================================
     size_t i = 0;
     unsigned long long ultimateT0_corrected = lastT0_[modID];    
     unsigned long long currentBaseTime_corrected = lastT0_[modID];
@@ -407,6 +402,7 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
     while (i + 8 <= count) {
         unsigned char header = buf[i];
 
+        // 同期ズレ検知
         if (header != 0x69 && header != 0x6a) {
             hasDataAligned_[modID] = false; 
             hasFoundT0_[modID] = false; 
@@ -414,75 +410,134 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
             return {ultimateT0_corrected, isEOF};
         }
 
-        // [T0 パケット処理]
+        // -----------------------------------------------------
+        // [T0 パケット処理] (時刻同期の要)
+        // -----------------------------------------------------
         if (header == 0x69) { 
             unsigned char* p = &buf[i + 1];
-            // --- 生時刻のデコード (raw_t) ---
-            unsigned long long raw_t = ((unsigned long long)p[0] << 24 | (unsigned long long)p[1] << 16 | 
-                                       (unsigned long long)p[2] << 8 | (unsigned long long)p[3]) * 1000000000ULL + 
-                                       ((unsigned long long)p[4] << 2 | (unsigned long long)(p[5] & 0xC0) >> 6) * 1000000ULL + 
-                                       ((unsigned long long)(p[5] & 0x3F) << 2 | (unsigned long long)(p[6] & 0xC0) >> 6);
+            // 生時刻 (Raw Time) のデコード
+            unsigned long long raw_t = 
+                ((unsigned long long)p[0] << 24 | (unsigned long long)p[1] << 16 | 
+                 (unsigned long long)p[2] << 8  | (unsigned long long)p[3]) * 1000000000ULL + 
+                ((unsigned long long)p[4] << 2  | (unsigned long long)(p[5] & 0xC0) >> 6) * 1000000ULL + 
+                ((unsigned long long)(p[5] & 0x3F) << 2 | (unsigned long long)(p[6] & 0xC0) >> 6);
 
-            // --- ワープ検知 & 10パケット検証ロジック (シーク方式) ---
-            if (hasFoundT0_[modID]) {
-                // lastRawT0_[modID] との差分を確認 (1msリズムから外れたか)
-                long long diff = (long long)raw_t - (long long)lastRawT0_[modID];
-                
-                if (std::abs(diff - 1000000LL) > 500000LL) {
-                    // ワープの疑いあり。未来を覗き見して検証 (ディスクシークを使用)
-                    std::streampos currentFilePos = ifs.tellg(); // チャンク読み込み後の位置
+            // -------------------------------------------------
+            // Case A: 初期化 & ファイル切り替え時のブリッジ処理
+            // -------------------------------------------------
+            if (!hasFoundT0_[modID]) {
+                // [A-1] プログラム起動直後 (真の初回)
+                if (lastT0_[modID] == 0) {
+                    moduleOffsets_[modID] = 0; 
+                    hasFoundT0_[modID] = true;
+                    lastRawT0_[modID] = raw_t;
+                    lastT0_[modID] = raw_t;    
                     
-                    // 実際の位置 = offset + 現在のバッファ内位置(i) + 次のパケットへ(8)
-                    ifs.seekg(offset + i + 8, std::ios::beg); 
-                    
-                    int validT0Count = 0;
-                    unsigned long long tempPrevRaw = raw_t;
-                    unsigned char v[8];
-                    
-                    // 次のT0を10個見つけてリズムを確認
-                    while (validT0Count < 10 && ifs.read((char*)v, 8)) {
-                        if (v[0] == 0x69) {
-                            unsigned long long vt = ((unsigned long long)v[1] << 24 | (unsigned long long)v[2] << 16 | 
-                                                    (unsigned long long)v[3] << 8 | (unsigned long long)v[4]) * 1000000000ULL + 
-                                                    ((unsigned long long)v[5] << 2 | (unsigned long long)(v[6] & 0xC0) >> 6) * 1000000ULL + 
-                                                    ((unsigned long long)(v[6] & 0x3F) << 2 | (unsigned long long)(v[7] & 0xC0) >> 6);
-                            
-                            if (std::abs((long long)(vt - tempPrevRaw) - 1000000LL) < 100000LL) {
-                                validT0Count++;
-                                tempPrevRaw = vt;
-                            } else { break; }
-                        }
-                    }
-                    // 元の位置（チャンク末端）に戻す (これを忘れるとファイル読み込みが狂うが、ここは正しい)
-                    ifs.seekg(currentFilePos, std::ios::beg); 
-                    ifs.clear();
-
-                    if (validT0Count >= 10) {
-                        // 本物のワープ確定。新しいオフセットを算出
-                        long long jump = (long long)raw_t - ((long long)lastRawT0_[modID] + 1000000LL);
-                        moduleOffsets_[modID] += jump;
-                        
-                        // ログ出力 (デバッグ用)
-                        // std::cout << "[WARP] Mod" << modID << " Jump corrected. Offset=" << moduleOffsets_[modID] << std::endl;
-                    }
+                    printLog(Form("[START] Mod%d Analysis Start at T=%llu", modID, lastT0_[modID]));
+                    i += 8; continue; 
                 }
+
+                // [A-2] ファイル切り替え時の接続チェック (あかり式・安全ブリッジ)
+                unsigned long long targetTime = lastT0_[modID] + 1000000LL; 
+                long long currentOff = moduleOffsets_[modID];
+                
+                long long diff_keep = (long long)(raw_t - currentOff) - (long long)targetTime; // 現状維持
+                long long diff_zero = (long long)raw_t - (long long)targetTime;               // リセット
+                
+                long long bridgeThreshold = 1000000000LL; // 許容範囲: 1秒
+
+                if (std::abs(diff_keep) < bridgeThreshold) { 
+                    printLog(Form("[BRIDGE] Mod%d OK: Keep Offset. Diff=%lld ns", modID, diff_keep));
+                    // Offset維持
+                }
+                else if (std::abs(diff_zero) < bridgeThreshold) { 
+                    printLog(Form("[BRIDGE] Mod%d OK: Offset Reset detected. Diff=%lld ns", modID, diff_zero));
+                    moduleOffsets_[modID] = 0;
+                }
+                else {
+                    // どちらも繋がらない場合はデータ不整合として停止 (強制連結はしない)
+                    printLog(Form("[FATAL ERROR] Mod%d: Timestamp discontinuity at File Boundary!", modID));
+                    printLog(Form("  LastT0: %llu, RawT: %llu, Target: %llu", lastT0_[modID], raw_t, targetTime));
+                    return {lastT0_[modID], true}; // EOF扱いとして安全に抜ける
+                }
+
+                // 状態確定
+                hasFoundT0_[modID] = true;
+                lastRawT0_[modID] = raw_t; 
+                lastT0_[modID] = raw_t - moduleOffsets_[modID]; 
+                
+                i += 8; continue; 
             }
 
-            // --- 補正後時刻の計算 ---
+            // -------------------------------------------------
+            // Case B: 通常動作 (ワープ検知 & 1秒ルール検証)
+            // -------------------------------------------------
+            long long diff = (long long)raw_t - (long long)lastRawT0_[modID];
+            
+            // 閾値を 1秒 (10^9 ns) に設定
+            if (std::abs(diff - 1000000LL) > 1000000000LL) {
+                // 未来検証のための準備 (ディスクシーク)
+                std::streampos currentFilePos = ifs.tellg(); 
+                ifs.seekg(offset + i + 8, std::ios::beg); 
+                
+                int validT0Count = 0;
+                unsigned long long tempPrevRaw = raw_t;
+                unsigned char v[8];
+                
+                // 次のT0を10個先読みしてリズムを確認
+                while (validT0Count < 10 && ifs.read((char*)v, 8)) {
+                    if (v[0] == 0x69) {
+                        unsigned long long vt = ((unsigned long long)v[1] << 24 | (unsigned long long)v[2] << 16 | 
+                                                (unsigned long long)v[3] << 8  | (unsigned long long)v[4]) * 1000000000ULL + 
+                                                ((unsigned long long)v[5] << 2  | (unsigned long long)(v[6] & 0xC0) >> 6) * 1000000ULL + 
+                                                ((unsigned long long)(v[6] & 0x3F) << 2 | (unsigned long long)(v[7] & 0xC0) >> 6);
+                        
+                        // 検証ループ内も 1秒ルール (ASICの前後を許容)
+                        if (std::abs((long long)(vt - tempPrevRaw) - 1000000LL) < 1000000000LL) {
+                            validT0Count++;
+                            tempPrevRaw = vt;
+                        } else { break; }
+                    }
+                }
+                
+                // 元の位置に戻す
+                ifs.clear();
+                ifs.seekg(currentFilePos, std::ios::beg); 
+
+                // 検証結果判定
+                if (validT0Count < 10) {
+                    // 検証失敗ガード: このパケットは信頼できないためスキップ
+                    // printLog(Form("[WARN] T0 Verification Failed (%d/10). Skipping.", validT0Count));
+                    i += 8; 
+                    return {ultimateT0_corrected, isEOF}; // 以前の時刻を維持してリターン
+                }
+
+                // 検証成功 (10/10): オフセットを更新
+                long long jump = (long long)raw_t - ((long long)lastRawT0_[modID] + 1000000LL);
+                moduleOffsets_[modID] += jump;
+                printLog(Form("[SYNC] Mod%d: Warp Corrected. Jump=%lld ns", modID, jump));
+            }
+
+            // --- 最終的な時刻計算と更新 ---
             unsigned long long corrected_t = raw_t - moduleOffsets_[modID];
             
             i += 8;
-            if (corrected_t <= lastT0_[modID] && lastT0_[modID] != 0) continue; // 重複排除
+            
+            // 重複排除 (過去に戻る時刻は無視)
+            if (corrected_t <= lastT0_[modID] && lastT0_[modID] != 0) continue; 
 
+            // 状態更新
             hasFoundT0_[modID] = true;
-            lastRawT0_[modID] = raw_t;       // 次回判定用に「生」を保存
-            lastT0_[modID] = corrected_t;    // クラス全体には「補正後」を報告
+            lastRawT0_[modID] = raw_t;       
+            lastT0_[modID] = corrected_t;    
             ultimateT0_corrected = corrected_t;
             currentBaseTime_corrected = corrected_t;
             continue;
         }
 
+        // -----------------------------------------------------
         // [Event パケット処理]
+        // -----------------------------------------------------
         if (header == 0x6a) { 
             if (hasFoundT0_[modID] && currentBaseTime_corrected > 0) {
                 unsigned char* p = &buf[i + 1];
@@ -490,8 +545,11 @@ std::pair<unsigned long long, bool> DetectorAnalyzer::readEventsFromFile(const s
                 unsigned int pw  = ((unsigned int)p[3] << 12 | (unsigned int)p[4] << 4 | (unsigned int)(p[5] & 0xF0) >> 4);
                 int pixel = (int)p[6];
                 
-                // すでに補正済みの currentBaseTime_corrected を使うので、evTime も自動的に補正される
-                unsigned long long evTime = currentBaseTime_corrected + static_cast<unsigned long long>(tof) - static_cast<unsigned long long>(pw);
+                // currentBaseTime_corrected は補正済みなので、そのまま加算
+                unsigned long long evTime = currentBaseTime_corrected + 
+                                            static_cast<unsigned long long>(tof) - 
+                                            static_cast<unsigned long long>(pw);
+                
                 rawEvents.push_back({0, pixel, modID, evTime, (int)pw, pixel});
             }
             i += 8;
@@ -730,38 +788,66 @@ void DetectorAnalyzer::processBinaryFiles(std::map<int, std::deque<std::string>>
         }
 
         // --- 7. UI更新 (200ms) ---
+        // --- 7. UI更新 (200ms) ---
         auto now = std::chrono::system_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUIDraw).count() > 200) {
             lastUIDraw = now;
             
-            double progress = 0.0;
+            double totalProgress = 0.0;
             if (analysisDuration_ns_ != std::numeric_limits<unsigned long long>::max()) {
-                progress = (double)finalTotalTimeNs_ / (double)analysisDuration_ns_ * 100.0;
+                totalProgress = (double)finalTotalTimeNs_ / (double)analysisDuration_ns_ * 100.0;
             } else if (totalDataSize_ > 0) {
-                progress = (double)processedDataSize_ / totalDataSize_ * 100.0;
+                totalProgress = (double)processedDataSize_ / totalDataSize_ * 100.0;
             }
-            if (progress > 100.0) progress = 100.0;
+            if (totalProgress > 100.0) totalProgress = 100.0;
 
             std::stringstream ss;
+            // SYSヘッダー: SafeTimeも分単位で見やすく
+            double safeTimeMin = (double)safeTime / 1e9 / 60.0;
             ss << "\r\033[K" 
-               << "Progress: [" << std::fixed << std::setprecision(1) << progress << "%] "
-               << "Live: " << std::fixed << std::setprecision(2) << (double)finalTotalTimeNs_/1e9/60.0 << " min "
-               << "(SafeTime: " << safeTime << ")\n";
+               << " [SYS] Total: " << std::fixed << std::setprecision(1) << std::setw(5) << totalProgress << "%"
+               << " | Live: " << std::setw(6) << (double)finalTotalTimeNs_/1e9/60.0 << " min"
+               << " | SafeTime: " << safeTimeMin << " min\n";
             
             int lineCount = 1;
             for (int m : activeModuleIDs_) {
-                auto getBar = [&](int mID) {
-                    int w = 15; 
-                    double r = (double)moduleBuffers[mID].size() / PER_MOD_CAP;
-                    if (r > 1.0) r = 1.0;
-                    int f = (int)(r * w);
-                    std::string b = "["; for(int k=0; k<w; ++k) b += (k < f ? "#" : "."); return b + "]";
+                unsigned long long currentT = lastT0_[m]; 
+                long long currentAddr = currentFileOffsets_[m];
+                
+                // --- ファイルサイズの取得 ---
+                long long currentFileSize = 1; 
+                std::string fname = "(No File)";
+                if (!fileQueues[m].empty()) {
+                    std::string fpath = fileQueues[m].front();
+                    fname = std::filesystem::path(fpath).filename().string();
+                    currentFileSize = std::filesystem::file_size(fpath);
+                }
+                
+                // ファイル名が長すぎる場合は「末尾」を表示する (連番が見えるように)
+                if (fname.length() > 28) {
+                    fname = "..." + fname.substr(fname.length() - 25);
+                }
+
+                // バー生成
+                auto drawBar = [](double r, int w, char c) {
+                    int p = (int)(std::min(1.0, std::max(0.0, r)) * w);
+                    std::string b = "[";
+                    for(int k=0; k<w; ++k) b += (k < p ? c : '.');
+                    return b + "]";
                 };
-                auto getFile = [&](int mID) {
-                    if (fileQueues[mID].empty()) return std::string("(No File)");
-                    return std::filesystem::path(fileQueues[mID].front()).filename().string();
-                };
-                ss << "\033[K" << " M" << m << ": " << std::left << std::setw(28) << getFile(m).substr(0, 27) << " " << getBar(m) << "\n";
+
+                double fileRatio = (double)currentAddr / (double)currentFileSize;
+                double bufferRatio = (double)moduleBuffers[m].size() / PER_MOD_CAP;
+                double timeMin = (double)currentT / 1e9 / 60.0; // 分換算
+
+                // --- 表示レイアウト: ID | ファイル名(28) | 物理進捗 | 時刻(min) | バッファ ---
+                ss << "\033[K" 
+                   << " M" << m << " | " 
+                   << std::left  << std::setw(28) << fname << " | "
+                   << "File:" << drawBar(fileRatio, 10, '=') << std::right << std::setw(5) << std::fixed << std::setprecision(1) << (fileRatio * 100.0) << "% | "
+                   << "T:" << std::setw(10) << std::fixed << std::setprecision(1) << timeMin << "m | "
+                   << "Buf:" << drawBar(bufferRatio, 10, '#') << "\n";
+                
                 lineCount++;
             }
             ss << "\033[" << lineCount << "A"; 
