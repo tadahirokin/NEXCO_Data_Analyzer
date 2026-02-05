@@ -46,10 +46,11 @@ const int Y_CHANNEL_OFFSET = 64;
 const unsigned long long GAIN_ANALYSIS_WINDOW_NS = 600000000000ULL; // 10分
 const unsigned long long MODULE_DEATH_TIMEOUT_NS = 1000000000ULL;   // 1.0秒
 
-// ヒストグラム設定 (20ns/bin)
-const int MONITOR_HIST_BINS = 5000;      
+// ヒストグラム設定 (1ns/bin precision)
+// MONITOR_HIST_MAX_TOT (100000ns) / BIN_WIDTH_NS (1.0ns) = 100000 bins
 const double MONITOR_HIST_MAX_TOT = 100000.0;
-const double BIN_WIDTH_NS = 20.0; 
+const double BIN_WIDTH_NS = 1.0; 
+const int MONITOR_HIST_BINS = 100000;      
 
 // ピーク探索・マッチング設定
 const double PEAK_SEARCH_MIN_TOT = 10000.0; // 10us
@@ -95,7 +96,7 @@ public:
     bool isAnalysisStarted_; 
 
 private:
-    // --- コンストラクタ初期化リストで要求されている変数群 ---
+    // --- コンストラクタ初期化リスト用変数 ---
     int timeWindow_ns_;
     TGraph* gT0Check;
     long t0GlobalCount_;
@@ -106,12 +107,12 @@ private:
     double totalEffectiveTimeSec_;
     unsigned long long prevEventTimeForEff_;
 
-    // --- .cpp 1041行目付近で要求されているメイン配列 ---
+    // --- メインヒストグラム配列 ---
     TH1F* hRawToT_Global[128];
     TH1F* hGainCheck_Global[128];
 
     // --- メソッド宣言 ---
-    void printSurvivalReport(); // 278行目のエラーを解消
+    void printSurvivalReport();
     void saveCurrentStatus(unsigned long long currentTime_ns);
     void setupTree();
     void generatePDFReport();
@@ -130,7 +131,9 @@ private:
     std::map<std::pair<int, int>, TGraph*> gainEvolutionGraphs_;
     std::map<std::pair<int, int>, TGraph*> rateEvolutionGraphs_;
 
-    // --- ゲイン追尾パラメータ ---
+    // --- ゲイン解析用パラメータ ---
+    // ※ 新ロジックでは毎回絶対値を探索するため、cumulativeShift等は使用しないが
+    //    クラス構造維持のために残置 (将来的な機能拡張用)
     std::map<std::pair<int, int>, double> initialPeakPosMap_;
     std::map<std::pair<int, int>, double> cumulativeShiftNsMap_;
     std::map<std::pair<int, int>, int> rangeMinMap_;
@@ -177,12 +180,21 @@ private:
     short getRunID(const std::string& prefix);
     std::string parseRunPrefix(const std::string& fullPath);
 
-    // --- Gain Analysis ---
+    // --- Gain Analysis (Updated for 1ns Centroid) ---
     bool analyzeGainShift(unsigned long long currentTime_ns);
-    int findRightMostPeak(TH1F* hist); 
+    
+    // 【変更】戻り値を int(ビン番号) から double(ns) に変更
+    double findRightMostPeak(TH1F* hist); 
+    
+    // 【追加】重心計算ヘルパー
+    double calculateCentroid(TH1F* h, int maxBin, int windowBins); 
+
     void determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin);
+    
+    // ライブラリ機能として温存 (現在の解析ループでは未使用)
     int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax);
     double calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax, double scale);
+    
     double calculatePeakAreaCovell(TH1F* hist, double peakPos); 
     
     // --- ROOT I/O ---
