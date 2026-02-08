@@ -47,10 +47,11 @@ const unsigned long long GAIN_ANALYSIS_WINDOW_NS = 600000000000ULL; // 10分
 const unsigned long long MODULE_DEATH_TIMEOUT_NS = 1000000000ULL;   // 1.0秒
 
 // ヒストグラム設定 (1ns/bin precision)
-// MONITOR_HIST_MAX_TOT (100000ns) / BIN_WIDTH_NS (1.0ns) = 100000 bins
 const double MONITOR_HIST_MAX_TOT = 100000.0;
 const double BIN_WIDTH_NS = 1.0; 
-const int MONITOR_HIST_BINS = 100000;      
+
+// ★修正: 他の定数から計算で導出する（静的キャストで整数化）
+const int MONITOR_HIST_BINS = static_cast<int>(MONITOR_HIST_MAX_TOT / BIN_WIDTH_NS);
 
 // ピーク探索・マッチング設定
 const double PEAK_SEARCH_MIN_TOT = 10000.0; // 10us
@@ -65,6 +66,7 @@ public:
         unsigned long long eventTime_ns;
         int tot;
         int sysCh;
+        double correctedTot;
     };
 
     struct ChConfig {
@@ -110,6 +112,7 @@ private:
     // --- メインヒストグラム配列 ---
     TH1F* hRawToT_Global[128];
     TH1F* hGainCheck_Global[128];
+    std::map<std::pair<int, int>, TGraph*> gainOverlayGraphs_;
 
     // --- メソッド宣言 ---
     void printSurvivalReport();
@@ -119,6 +122,8 @@ private:
     void calculateEffectiveTime();
     void printLog(const std::string& msg);
     void printFileTail(const std::string& filePath, long long currentOffset);
+    // フラックス保存リビニング用のヘルパー関数
+    void fillFluxConserving(TH1F* h, double rawToT, double scale);
 
     // --- 解析器の構成データ ---
     std::map<std::pair<int, int>, ChConfig> detConfigMap_; 
@@ -132,8 +137,6 @@ private:
     std::map<std::pair<int, int>, TGraph*> rateEvolutionGraphs_;
 
     // --- ゲイン解析用パラメータ ---
-    // ※ 新ロジックでは毎回絶対値を探索するため、cumulativeShift等は使用しないが
-    //    クラス構造維持のために残置 (将来的な機能拡張用)
     std::map<std::pair<int, int>, double> initialPeakPosMap_;
     std::map<std::pair<int, int>, double> cumulativeShiftNsMap_;
     std::map<std::pair<int, int>, int> rangeMinMap_;
@@ -168,34 +171,47 @@ private:
     bool isTemplateCaptured_;
     bool isCsvHeaderWritten_;
 
+    // privateセクションに追加
+    bool findPeakAndIntegrate(TH1F* h, double& outCentroid, double& outCount);
+
     static const int COVELL_WINDOW_NS = 200;
 
-    // --- Binary Sync & Decode ---
-    unsigned long long findNextT0(const std::string& fileName, int modID, long long& offset);
-    bool syncDataStream(std::ifstream& ifs, long long& skippedBytes);
+    // --- Binary Sync & Decode (Updated) ---
+    // [Helper] ビット演算によるT0デコード
+    unsigned long long decodeT0(const unsigned char* p);
+
+    // [Helper] デッドタイム区間のマージ集計
+    unsigned long long calculateTotalDeadTime(std::vector<std::pair<unsigned long long, unsigned long long>>& ranges);
+
+    // [Phase 1] 1バイトスキャンによる8バイトグリッド確立
+    bool performAlignment(const std::vector<unsigned char>& buf, size_t& idx, size_t maxLimit);
+
+    // [Phase 2] グリッド上での次パケットT0探索
+    int findNextT0(const std::vector<unsigned char>& buf, size_t& idx, size_t maxLimit, unsigned long long& t0_out);
+
+    // [Phase 3] モジュール間足並み揃え（同期プロセス）
+    long long synchronizeStream(const std::string& fileName, int modID, long long startOffset, unsigned long long targetTime);
+
+    // [Main] データ読み出しオーケストレーター
     std::pair<unsigned long long, bool> readEventsFromFile(const std::string& fileName, int modID, std::vector<Event>& rawEvents, long long& offset);
+
+    // --- データ処理・ラン管理 ---
     bool processChunk(const std::vector<Event>& sortedEvents);      
     unsigned long long getSafeTime(const std::map<int, unsigned long long>& lastTimes);
     std::string getRunSignature(const std::string& fileName);
     short getRunID(const std::string& prefix);
     std::string parseRunPrefix(const std::string& fullPath);
 
-    // --- Gain Analysis (Updated for 1ns Centroid) ---
+    // --- Gain Analysis ---
     bool analyzeGainShift(unsigned long long currentTime_ns);
     
-    // 【変更】戻り値を int(ビン番号) から double(ns) に変更
-    double findRightMostPeak(TH1F* hist); 
-    
-    // 【追加】重心計算ヘルパー
-    double calculateCentroid(TH1F* h, int maxBin, int windowBins); 
-
-    void determineIntegrationRange(TH1F* hist, int peakBin, int& outMinBin, int& outMaxBin);
-    
-    // ライブラリ機能として温存 (現在の解析ループでは未使用)
     int findBestShift(TH1F* hTarget, TH1F* hTemplate, int binMin, int binMax);
     double calculateResidual(TH1F* hTarget, TH1F* hTemplate, int shiftBins, int binMin, int binMax, double scale);
-    
     double calculatePeakAreaCovell(TH1F* hist, double peakPos); 
+
+    TH1F* hCorrectedToT_Global[128]; // ★新規: 補正後ToTヒストグラム
+    double currentScaleFactors_[128]; // ★新規: 現在の補正係数 (初期値 1.0)
+    double initialPeakPositions_[128]; // ★新規: 基準となるピーク位置 (t=0-10min)
     
     // --- ROOT I/O ---
     TFile* outputFile_;
@@ -212,7 +228,9 @@ private:
     TH1F *hEventWidth_CondA;
     TH1F *hEventWidth_CondB;
 
-    // --- Warp & Sync ---
+    Double_t b_corrected_tot; // ★新規: Tree保存用 (高精度のためdouble)
+
+    // --- Warp & Sync Status ---
     std::map<int, unsigned long long> lastT0_;     
     std::map<int, unsigned long long> lastRawT0_;  
     std::map<int, long long> moduleOffsets_;       
@@ -250,7 +268,8 @@ private:
     double b_i_width;
     std::vector<int>    *b_i_type;
     std::vector<int>    *b_i_strip;
-    std::vector<int>    *b_i_tot;
+    //std::vector<int>    *b_i_tot;
+    std::vector<double> *b_i_corrected_tot;
     std::vector<double> *b_i_time;
     std::deque<Event> analysisBuffer_;
     int globalEventID_Ideal_;
